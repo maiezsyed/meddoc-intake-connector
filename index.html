@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meddoc Intake Connector (Preview)</title>
+  <meta name="description" content="Athenahealth sandbox integration for document ingest, search, and secure retrieval. System-to-system (2-legged OAuth). Not an ONC-Certified API app.">
+  <style>
+    body {font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:0; padding:0; line-height:1.6;}
+    header {padding:48px 16px; text-align:center;}
+    h1 {margin:0 0 8px; font-size:28px;}
+    .tag {display:inline-block; padding:4px 10px; border-radius:999px; background:#f2f2f2; font-size:12px;}
+    main {max-width:900px; margin:0 auto; padding:0 16px 64px;}
+    section {margin:28px 0;}
+    ul {margin:8px 0 0 20px;}
+    code, pre {background:#fafafa; padding:2px 6px; border-radius:6px;}
+    footer {border-top:1px solid #eee; padding:16px; font-size:12px; color:#666; text-align:center;}
+    .pill {background:#eef; border:1px solid #dde; padding:2px 8px; border-radius:999px; font-size:12px;}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Meddoc Intake Connector (Preview)</h1>
+    <div class="tag">Athenahealth Sandbox • System-to-system (2‑legged OAuth)</div>
+  </header>
+  <main>
+    <section>
+      <h2>Overview</h2>
+      <p>Meddoc Intake Connector centralizes patient intake documents and makes them searchable. Phase‑1 integrates with the Athenahealth <strong>Preview</strong> environment to associate documents with sandbox patient identifiers while keeping files securely in Azure storage. No end‑user login is required.</p>
+      <ul>
+        <li><strong>Upload:</strong> Accept files from automations (e.g., Logic Apps)</li>
+        <li><strong>Index:</strong> Cosmos DB metadata + Azure AI Search text snippets</li>
+        <li><strong>Retrieve:</strong> Short‑lived SAS links for secure downloads</li>
+        <li><strong>Link (optional):</strong> Store Athena patient/encounter IDs for future write‑back</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Key Facts</h2>
+      <ul>
+        <li><span class="pill">Not ONC‑Certified API (CAPI)</span></li>
+        <li><span class="pill">Not a PHR / no patient login</span></li>
+        <li><span class="pill">Sandbox only (non‑production)</span></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Security & Privacy</h2>
+      <ul>
+        <li>OAuth2 client‑credentials (backend‑only)</li>
+        <li>TLS/HTTPS in transit; Azure‑encrypted at rest</li>
+        <li>Short‑lived download links (SAS)</li>
+        <li>Intended for sandbox test data. Do not upload real PHI without appropriate agreements and production hardening.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Getting Started</h2>
+      <ol>
+        <li>Request a demo or share sandbox patient identifiers.</li>
+        <li>We’ll provide API base URL and token scope.</li>
+        <li>Use our Postman collection to <code>POST /documents</code>, <code>GET /search</code>, and <code>GET /documents/{id}</code>.</li>
+      </ol>
+      <p><em>Example sandbox practice ID:</em> 195900 (subject to configuration).</p>
+    </section>
+
+    <section>
+      <h2>Contact</h2>
+      <p>Email: <a href="mailto:YOUR_EMAIL_HERE">maiez.syed@gmail.com</a></p>
+      <p>Support/Issues: <a href="YOUR_SUPPORT_URL">maiez.syed@gmail.com<L</a></p>
+    </section>
+  </main>
+  <footer>
+    <p>© Maiez Syed, 2025. Provided “as is” for sandbox testing. Trademarks belong to their owners.</p>
+  </footer>
+</body>
+</html>
