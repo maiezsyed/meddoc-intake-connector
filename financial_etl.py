@@ -338,6 +338,14 @@ def process_plan_data(excel_path: str, client_name: str, project_title: str) -> 
     print(f"[INFO] Dropped {dropped} rows where Hours was 0 or NaN")
     print(f"[INFO] Remaining rows: {len(df_melted)}")
 
+    # CRITICAL: Warn if no rows remain
+    if len(df_melted) == 0:
+        raise ValueError(
+            "[ERROR] No rows remain after filtering out zero/NaN hours!\n"
+            "  This means ALL hour values in the date columns were either 0 or empty.\n"
+            f"  Check that your data starts at row {PLAN_DATA_SKIP_ROWS + 1} and has numeric hour values."
+        )
+
     # Add Client Name and Project Title
     df_melted['client_name'] = client_name
     df_melted['project_title'] = project_title
@@ -483,6 +491,13 @@ def upload_to_bigquery(
     print(f"[INFO] Credentials file: {credentials_path}")
     print(f"[INFO] Rows to upload: {len(df)}")
 
+    # CRITICAL: Fail if no rows to upload
+    if len(df) == 0:
+        raise ValueError(
+            "[ERROR] No rows to upload! The DataFrame is empty.\n"
+            "  Check the processing steps above to see where data was lost."
+        )
+
     # Validate credentials file exists
     creds_path = Path(credentials_path)
     if not creds_path.exists():
@@ -572,6 +587,31 @@ def run_etl(
         raise FileNotFoundError(f"[ERROR] Excel file not found: {excel_path}")
 
     print(f"[OK] Excel file found: {excel_path}")
+
+    # List all available sheets for debugging
+    print(f"\n[DEBUG] Discovering sheet names in workbook...")
+    xlsx = pd.ExcelFile(excel_path, engine='openpyxl')
+    print(f"[DEBUG] Available sheets ({len(xlsx.sheet_names)}):")
+    for i, sheet_name in enumerate(xlsx.sheet_names):
+        marker = ""
+        if sheet_name == RATE_CARD_SHEET_NAME:
+            marker = " <-- Rate Card sheet"
+        elif sheet_name == PLAN_SHEET_NAME:
+            marker = " <-- Plan sheet"
+        print(f"  {i+1}. \"{sheet_name}\"{marker}")
+
+    # Validate expected sheets exist
+    if RATE_CARD_SHEET_NAME not in xlsx.sheet_names:
+        raise ValueError(
+            f"[ERROR] Rate Card sheet not found: '{RATE_CARD_SHEET_NAME}'\n"
+            f"  Available sheets: {xlsx.sheet_names}"
+        )
+    if PLAN_SHEET_NAME not in xlsx.sheet_names:
+        raise ValueError(
+            f"[ERROR] Plan sheet not found: '{PLAN_SHEET_NAME}'\n"
+            f"  Available sheets: {xlsx.sheet_names}"
+        )
+    print(f"[OK] Both required sheets found")
 
     # Step 1: Process Rate Card
     df_rate_card = process_rate_card(excel_path)
