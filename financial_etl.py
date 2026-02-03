@@ -27,21 +27,28 @@ RATE_CARD_SHEET_NAME = "x_Rate Card (Master Rates)"
 PLAN_SHEET_NAME = "Plan (Allocations)"
 
 RATE_CARD_SKIP_ROWS = 3  # Header is on row 4 (0-indexed: row 3)
-PLAN_DATA_SKIP_ROWS = 29  # Data headers start at row 30 (0-indexed: row 29)
+PLAN_DATA_SKIP_ROWS = 28  # Data headers start at row 29 (0-indexed: row 28)
 
 RATE_CARD_REQUIRED_COLUMNS = ['market_region', 'department', 'level', 'role', 'rate', 'cost rate']
 MERGE_KEYS = ['market_region', 'department', 'role']
 
-# Column rename mappings
-RATE_CARD_RENAME = {'title': 'role'}
-PLAN_RENAME = {
-    'market': 'market_region',
-    'department': 'department',
-    'role': 'role',
+# Column rename mappings for Rate Card (applied after lowercasing)
+RATE_CARD_RENAME = {
+    'title': 'role',  # If 'title' exists, rename to 'role'
 }
 
-# Date pattern for identifying date columns (YYYY-MM-DD format)
-DATE_COLUMN_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+# Column rename mappings for Plan sheet (applied after lowercasing)
+PLAN_RENAME = {
+    'market': 'market_region',  # If 'market' exists, rename to 'market_region'
+}
+
+# Known dimension columns in Plan sheet (not week/period columns)
+PLAN_DIMENSION_COLUMNS = [
+    'category', 'role', 'market_region', 'department', 'team', 'specialization',
+    'name', 'bill rate', 'rate card override', 'disc. % override', 'bill rate override',
+    'final billable rate', 'total fees', 'cost rate', 'cost rate override',
+    'final cost rate', 'total cost', 'gross margin', 'total hours'
+]
 
 
 # =============================================================================
@@ -89,10 +96,42 @@ def clean_column_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def identify_date_columns(columns: list) -> list:
-    """Identify columns that match the YYYY-MM-DD date pattern."""
-    date_cols = [col for col in columns if DATE_COLUMN_PATTERN.match(str(col))]
-    return date_cols
+def identify_period_columns(columns: list, dimension_columns: list) -> list:
+    """
+    Identify period/week columns (columns that are NOT dimension columns).
+
+    Period columns are typically integers (week numbers: 1, 2, 3...) or dates.
+    We identify them by excluding known dimension columns.
+    """
+    # Normalize dimension columns for comparison
+    dim_cols_normalized = set(d.lower().replace('\n', ' ').strip() for d in dimension_columns)
+
+    period_cols = []
+    for col in columns:
+        col_str = str(col).lower().replace('\n', ' ').strip()
+
+        # Check if it's a known dimension column
+        is_dimension = False
+        for dim in dim_cols_normalized:
+            if dim in col_str or col_str in dim:
+                is_dimension = True
+                break
+
+        # Also check if column name contains certain keywords
+        if any(kw in col_str for kw in ['unnamed', 'optional', 'info', 'override', 'total', 'rate', 'margin', 'cost', 'fee']):
+            is_dimension = True
+
+        # If it's a number (int or float, but not NaN), it's likely a period column
+        if not is_dimension:
+            try:
+                if isinstance(col, (int, float)) and pd.notna(col):
+                    period_cols.append(col)
+                elif col_str.isdigit():
+                    period_cols.append(col)
+            except (ValueError, TypeError):
+                pass
+
+    return period_cols
 
 
 def validate_required_columns(df: pd.DataFrame, required: list, context: str) -> None:
@@ -292,22 +331,23 @@ def process_plan_data(excel_path: str, client_name: str, project_title: str) -> 
 
     print_columns(df, "Plan Data - After column rename")
 
-    # Identify date columns and dimension columns
+    # Identify period columns (week numbers) and dimension columns
     all_columns = list(df.columns)
-    date_columns = identify_date_columns(all_columns)
+    period_columns = identify_period_columns(all_columns, PLAN_DIMENSION_COLUMNS)
 
-    print(f"\n[DEBUG] Identified {len(date_columns)} date columns:")
-    if date_columns:
-        print(f"  First 5: {date_columns[:5]}")
-        print(f"  Last 5: {date_columns[-5:]}")
+    print(f"\n[DEBUG] Identified {len(period_columns)} period/week columns:")
+    if period_columns:
+        print(f"  First 5: {period_columns[:5]}")
+        print(f"  Last 5: {period_columns[-5:]}")
 
-    # Dimension columns are everything that's not a date column
-    dimension_columns = [col for col in all_columns if col not in date_columns]
+    # Dimension columns are everything that's not a period column
+    period_col_set = set(period_columns)
+    dimension_columns = [col for col in all_columns if col not in period_col_set]
     print(f"\n[DEBUG] Dimension columns ({len(dimension_columns)}): {dimension_columns}")
 
-    if not date_columns:
+    if not period_columns:
         raise ValueError(
-            "[ERROR] No date columns found matching YYYY-MM-DD pattern.\n"
+            "[ERROR] No period/week columns found (expected integer week numbers like 1, 2, 3...).\n"
             f"  Available columns: {all_columns}"
         )
 
@@ -315,14 +355,14 @@ def process_plan_data(excel_path: str, client_name: str, project_title: str) -> 
     required_dims = ['market_region', 'department', 'role']
     validate_required_columns(df, required_dims, "Plan Data (for merge)")
 
-    # Melt the date columns
-    print(f"\n[INFO] Melting {len(date_columns)} date columns into Date and Hours...")
+    # Melt the period columns into week and hours
+    print(f"\n[INFO] Melting {len(period_columns)} period columns into week and hours...")
 
     df_melted = pd.melt(
         df,
         id_vars=dimension_columns,
-        value_vars=date_columns,
-        var_name='date',
+        value_vars=period_columns,
+        var_name='week',
         value_name='hours'
     )
 
@@ -337,6 +377,14 @@ def process_plan_data(excel_path: str, client_name: str, project_title: str) -> 
     dropped = initial_rows - len(df_melted)
     print(f"[INFO] Dropped {dropped} rows where Hours was 0 or NaN")
     print(f"[INFO] Remaining rows: {len(df_melted)}")
+
+    # CRITICAL: Warn if no rows remain
+    if len(df_melted) == 0:
+        raise ValueError(
+            "[ERROR] No rows remain after filtering out zero/NaN hours!\n"
+            "  This means ALL hour values in the date columns were either 0 or empty.\n"
+            f"  Check that your data starts at row {PLAN_DATA_SKIP_ROWS + 1} and has numeric hour values."
+        )
 
     # Add Client Name and Project Title
     df_melted['client_name'] = client_name
@@ -483,6 +531,13 @@ def upload_to_bigquery(
     print(f"[INFO] Credentials file: {credentials_path}")
     print(f"[INFO] Rows to upload: {len(df)}")
 
+    # CRITICAL: Fail if no rows to upload
+    if len(df) == 0:
+        raise ValueError(
+            "[ERROR] No rows to upload! The DataFrame is empty.\n"
+            "  Check the processing steps above to see where data was lost."
+        )
+
     # Validate credentials file exists
     creds_path = Path(credentials_path)
     if not creds_path.exists():
@@ -572,6 +627,31 @@ def run_etl(
         raise FileNotFoundError(f"[ERROR] Excel file not found: {excel_path}")
 
     print(f"[OK] Excel file found: {excel_path}")
+
+    # List all available sheets for debugging
+    print(f"\n[DEBUG] Discovering sheet names in workbook...")
+    xlsx = pd.ExcelFile(excel_path, engine='openpyxl')
+    print(f"[DEBUG] Available sheets ({len(xlsx.sheet_names)}):")
+    for i, sheet_name in enumerate(xlsx.sheet_names):
+        marker = ""
+        if sheet_name == RATE_CARD_SHEET_NAME:
+            marker = " <-- Rate Card sheet"
+        elif sheet_name == PLAN_SHEET_NAME:
+            marker = " <-- Plan sheet"
+        print(f"  {i+1}. \"{sheet_name}\"{marker}")
+
+    # Validate expected sheets exist
+    if RATE_CARD_SHEET_NAME not in xlsx.sheet_names:
+        raise ValueError(
+            f"[ERROR] Rate Card sheet not found: '{RATE_CARD_SHEET_NAME}'\n"
+            f"  Available sheets: {xlsx.sheet_names}"
+        )
+    if PLAN_SHEET_NAME not in xlsx.sheet_names:
+        raise ValueError(
+            f"[ERROR] Plan sheet not found: '{PLAN_SHEET_NAME}'\n"
+            f"  Available sheets: {xlsx.sheet_names}"
+        )
+    print(f"[OK] Both required sheets found")
 
     # Step 1: Process Rate Card
     df_rate_card = process_rate_card(excel_path)
