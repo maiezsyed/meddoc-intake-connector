@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+project_id  = "your-gcp-project-id"
+region      = "US"
+dataset_id  = "delivery_finance"
+environment = "dev"  # or "staging", "prod"
