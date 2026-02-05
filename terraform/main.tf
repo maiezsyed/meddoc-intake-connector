@@ -133,6 +133,18 @@ resource "google_bigquery_table" "rate_cards" {
       description = "Date this rate becomes effective"
     },
     {
+      name        = "all_rates"
+      type        = "JSON"
+      mode        = "NULLABLE"
+      description = "All rate card columns as JSON (e.g., {'2023 DEPT': 250, 'Moody\\'s 2024': 275})"
+    },
+    {
+      name        = "extra_fields"
+      type        = "JSON"
+      mode        = "NULLABLE"
+      description = "Overflow for any non-standard columns"
+    },
+    {
       name        = "source_file"
       type        = "STRING"
       mode        = "NULLABLE"
@@ -283,6 +295,24 @@ resource "google_bigquery_table" "projects" {
       description = "User-provided metadata about the sheet (e.g., '2025 plan', 'WIP')"
     },
     {
+      name        = "sheet_metadata_zone"
+      type        = "JSON"
+      mode        = "NULLABLE"
+      description = "All key-value pairs extracted from the metadata zone (rows above data header)"
+    },
+    {
+      name        = "pricing_panel_qa"
+      type        = "JSON"
+      mode        = "NULLABLE"
+      description = "Extracted Q&A from Pricing Panel tab as JSON object"
+    },
+    {
+      name        = "extra_fields"
+      type        = "JSON"
+      mode        = "NULLABLE"
+      description = "Overflow for any sheet-specific fields not in the standard schema"
+    },
+    {
       name        = "ingested_at"
       type        = "TIMESTAMP"
       mode        = "REQUIRED"
@@ -292,6 +322,84 @@ resource "google_bigquery_table" "projects" {
 
   labels = {
     data_type = "project_metadata"
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Table: project_scope_docs
+# Scope documents and descriptions for RAG (from uploads, Q&A, user input)
+# -----------------------------------------------------------------------------
+
+resource "google_bigquery_table" "project_scope_docs" {
+  dataset_id          = google_bigquery_dataset.delivery_finance.dataset_id
+  table_id            = "project_scope_docs"
+  deletion_protection = false
+
+  schema = jsonencode([
+    {
+      name        = "doc_id"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Unique document identifier"
+    },
+    {
+      name        = "project_id"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "FK to projects table"
+    },
+    {
+      name        = "doc_type"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Source type: 'pricing_qa', 'user_input', 'pdf_upload', 'doc_upload', 'slides_upload', 'markdown_upload', 'sheet_metadata'"
+    },
+    {
+      name        = "source_name"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Original filename or source identifier"
+    },
+    {
+      name        = "content"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Full text content for RAG indexing"
+    },
+    {
+      name        = "content_summary"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Gemini-generated summary of the content"
+    },
+    {
+      name        = "section_tags"
+      type        = "STRING"
+      mode        = "REPEATED"
+      description = "Tags: 'scope', 'challenge', 'deliverables', 'timeline', 'team', 'budget'"
+    },
+    {
+      name        = "extra_fields"
+      type        = "JSON"
+      mode        = "NULLABLE"
+      description = "Any additional metadata from the document"
+    },
+    {
+      name        = "uploaded_by"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "User who uploaded/created this record"
+    },
+    {
+      name        = "ingested_at"
+      type        = "TIMESTAMP"
+      mode        = "REQUIRED"
+      description = "Timestamp when record was ingested"
+    }
+  ])
+
+  labels = {
+    data_type = "rag_content"
   }
 }
 
@@ -389,6 +497,12 @@ resource "google_bigquery_table" "allocations" {
       type        = "FLOAT64"
       mode        = "NULLABLE"
       description = "Calculated: hours * cost_rate"
+    },
+    {
+      name        = "extra_fields"
+      type        = "JSON"
+      mode        = "NULLABLE"
+      description = "Overflow for sheet-specific columns (e.g., specialization, team, overrides)"
     },
     {
       name        = "source_file"
@@ -620,11 +734,12 @@ output "dataset_id" {
 
 output "table_ids" {
   value = {
-    rate_cards    = google_bigquery_table.rate_cards.table_id
-    projects      = google_bigquery_table.projects.table_id
-    allocations   = google_bigquery_table.allocations.table_id
-    actuals       = google_bigquery_table.actuals.table_id
-    ingestion_log = google_bigquery_table.ingestion_log.table_id
+    rate_cards         = google_bigquery_table.rate_cards.table_id
+    projects           = google_bigquery_table.projects.table_id
+    project_scope_docs = google_bigquery_table.project_scope_docs.table_id
+    allocations        = google_bigquery_table.allocations.table_id
+    actuals            = google_bigquery_table.actuals.table_id
+    ingestion_log      = google_bigquery_table.ingestion_log.table_id
   }
   description = "BigQuery Table IDs"
 }
