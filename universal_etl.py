@@ -51,37 +51,47 @@ import pandas as pd
 
 SHEET_TYPE_PATTERNS = {
     'plan': [
-        r'plan',
+        r'^plan$',
+        r'plan\s*\(',
         r'allocation',
         r'forecast',
         r'staffing',
         r'20\d{2}.*plan',  # Year-prefixed plans like "2025 Plan"
+        r'plan.*20\d{2}',  # Plan with year suffix
     ],
     'rate_card': [
-        r'^rate\s*card$',
-        r'rate\s*card\s*\(',
-        r'_rate\s*card',
+        r'rate\s*card',
+        r'ratecard',
         r'custom.*rate',
-        r'ext.*rate',
+        r'deptapps.*rate',
     ],
     'actuals': [
         r'actual',
         r'timesheet',
         r'hours.*log',
+        r'pivot',  # Often actuals pivots
     ],
     'costs': [
         r'^costs?$',
         r'expense',
         r'vendor.*cost',
+        r'^extras?$',
     ],
     'investment_log': [
         r'invest.*log',
+        r'investment\s+log',
         r'overrun',
     ],
     'external_estimate': [
         r'ext.*estimate',
         r'client.*estimate',
         r'external.*summary',
+        r'^ext\s+',
+    ],
+    'media': [
+        r'^media$',
+        r'media.*plan',
+        r'media.*buy',
     ],
     'info': [
         r'^info$',
@@ -194,8 +204,9 @@ HEADER_KEYWORDS = {
     'rate_card': ['market', 'craft', 'role', 'title', 'cost rate', 'bill rate', 'level'],
     'actuals': ['market', 'employee', 'role', 'total hours'],
     'costs': ['item', 'category', 'date', 'vendor', 'total cost'],
-    'investment_log': ['date identified', 'investment summary', 'investment amount'],
-    'external_estimate': ['department', 'role', 'total hours', 'total fee'],
+    'investment_log': ['date identified', 'investment summary', 'investment amount', 'resource impact'],
+    'external_estimate': ['department', 'role', 'total hours', 'total fee', 'dedication'],
+    'media': ['channel', 'platform', 'budget', 'spend', 'impressions', 'vendor'],
 }
 
 
@@ -291,21 +302,26 @@ def normalize_column_name(col_name: str) -> str:
 def identify_week_columns(columns: list) -> list:
     """
     Identify columns that represent week/period numbers.
-    Returns list of (column_name, week_number) tuples.
+    Returns list of (column_name, week_number, type) tuples.
     """
     week_cols = []
 
     for col in columns:
+        if pd.isna(col):
+            continue
+
         col_str = str(col).strip()
 
         # Match patterns: "01", "1", "01-Hours", integers
         if re.match(r'^(0?[1-9]|[1-8][0-9]|90)$', col_str):
-            week_num = int(col_str)
+            week_num = int(col_str.lstrip('0') or '0')
             week_cols.append((col, week_num, 'fee'))
         elif re.match(r'^(0?[1-9]|[1-8][0-9]|90)-[Hh]ours$', col_str):
-            week_num = int(re.match(r'^(\d+)', col_str).group(1))
-            week_cols.append((col, week_num, 'hours'))
-        elif isinstance(col, (int, float)) and 1 <= col <= 90:
+            match = re.match(r'^(\d+)', col_str)
+            if match:
+                week_num = int(match.group(1).lstrip('0') or '0')
+                week_cols.append((col, week_num, 'hours'))
+        elif isinstance(col, (int, float)) and not pd.isna(col) and 1 <= col <= 90:
             week_cols.append((col, int(col), 'fee'))
 
     return week_cols
@@ -372,61 +388,69 @@ def process_plan_sheet(
     fee_week_cols = [(col, wk) for col, wk, typ in week_cols if typ == 'fee']
 
     if fee_week_cols:
-        # Get the actual column names after normalization
-        fee_col_names = []
-        for orig_col, wk, _ in week_cols:
-            if _ == 'fee':
-                norm_name = normalize_column_name(str(orig_col))
-                if norm_name in df_data.columns:
-                    fee_col_names.append(norm_name)
-                elif str(orig_col) in df_data.columns:
-                    fee_col_names.append(str(orig_col))
-
-        # Find original week column names in df_data
+        # Find week columns that exist in the data after column normalization
         week_col_in_data = []
         for col in df_data.columns:
-            col_str = str(col)
+            col_str = str(col).strip()
+            # Check if it's a week number column (01-90 or 1-90)
             if re.match(r'^(0?[1-9]|[1-8][0-9]|90)$', col_str):
                 week_col_in_data.append(col)
-            elif isinstance(col, (int, float)) and 1 <= col <= 90:
-                week_col_in_data.append(col)
+            # Also check for integer columns
+            try:
+                if isinstance(col, (int, float)) and not pd.isna(col) and 1 <= int(col) <= 90:
+                    week_col_in_data.append(col)
+            except (ValueError, TypeError):
+                pass
 
         if week_col_in_data:
             # Melt the dataframe
             id_vars = [c for c in existing_dims if c in df_data.columns]
 
-            df_melted = pd.melt(
-                df_data,
-                id_vars=id_vars,
-                value_vars=week_col_in_data,
-                var_name='week_number',
-                value_name='hours'
-            )
+            try:
+                df_melted = pd.melt(
+                    df_data,
+                    id_vars=id_vars,
+                    value_vars=week_col_in_data,
+                    var_name='week_number',
+                    value_name='hours'
+                )
 
-            # Convert week_number to int
-            df_melted['week_number'] = df_melted['week_number'].apply(
-                lambda x: int(re.match(r'^(\d+)', str(x)).group(1)) if re.match(r'^(\d+)', str(x)) else x
-            )
+                # Convert week_number to int safely
+                def safe_week_num(x):
+                    try:
+                        match = re.match(r'^(\d+)', str(x).strip())
+                        if match:
+                            return int(match.group(1))
+                        return int(x)
+                    except:
+                        return 0
 
-            # Filter out zero/null hours
-            df_melted = df_melted[df_melted['hours'].notna() & (df_melted['hours'] != 0)]
+                df_melted['week_number'] = df_melted['week_number'].apply(safe_week_num)
 
-            # Add metadata columns
-            df_melted['source_sheet'] = sheet_name
-            df_melted['project_id'] = metadata.get('project_id', '')
+                # Filter out zero/null hours
+                df_melted = df_melted[df_melted['hours'].notna() & (df_melted['hours'] != 0)]
 
-            return {
-                'allocations': df_melted,
-                'metadata': sheet_metadata,
-                'row_count': len(df_melted),
-            }
+                # Add metadata columns
+                df_melted['source_sheet'] = sheet_name
+                df_melted['project_id'] = metadata.get('project_id', '')
 
-    # If no week columns, return dimension data only
+                return {
+                    'allocations': df_melted,
+                    'metadata': sheet_metadata,
+                    'row_count': len(df_melted),
+                }
+            except Exception as e:
+                if verbose:
+                    print(f"    Warning: Could not melt week columns: {str(e)}")
+                # Fall through to return dimension data only
+
+    # If no week columns or melting failed, return dimension data only
     df_data['source_sheet'] = sheet_name
     df_data['project_id'] = metadata.get('project_id', '')
 
+    cols_to_return = [c for c in existing_dims if c in df_data.columns] + ['source_sheet', 'project_id']
     return {
-        'allocations': df_data[existing_dims + ['source_sheet', 'project_id']] if existing_dims else df_data,
+        'allocations': df_data[cols_to_return] if cols_to_return else df_data,
         'metadata': sheet_metadata,
         'row_count': len(df_data),
     }
@@ -536,6 +560,99 @@ def process_costs_sheet(
 
     return {
         'costs': df_data,
+        'row_count': len(df_data),
+    }
+
+
+def process_investment_log_sheet(
+    df: pd.DataFrame,
+    sheet_name: str,
+    header_row: int,
+    metadata: dict,
+    verbose: bool = False
+) -> dict:
+    """Process an Investment Log sheet."""
+    df_data = df.iloc[header_row + 1:].copy()
+    df_data.columns = df.iloc[header_row].values
+
+    col_map = {col: normalize_column_name(col) for col in df_data.columns}
+    df_data = df_data.rename(columns=col_map)
+
+    # Remove empty rows - check for any non-null value in key columns
+    key_cols = ['investment_summary', 'investment_amount', 'date_identified']
+    existing_keys = [c for c in key_cols if c in df_data.columns]
+    if existing_keys:
+        df_data = df_data.dropna(subset=existing_keys, how='all')
+
+    df_data['source_sheet'] = sheet_name
+    df_data['project_id'] = metadata.get('project_id', '')
+
+    if verbose:
+        print(f"    Found {len(df_data)} investment log entries")
+
+    return {
+        'investment_log': df_data,
+        'row_count': len(df_data),
+    }
+
+
+def process_external_estimate_sheet(
+    df: pd.DataFrame,
+    sheet_name: str,
+    header_row: int,
+    metadata: dict,
+    verbose: bool = False
+) -> dict:
+    """Process an External Estimate sheet (client-facing summary)."""
+    df_data = df.iloc[header_row + 1:].copy()
+    df_data.columns = df.iloc[header_row].values
+
+    col_map = {col: normalize_column_name(col) for col in df_data.columns}
+    df_data = df_data.rename(columns=col_map)
+
+    # Remove empty rows
+    key_cols = ['department', 'role', 'total_fee', 'est_total_hours']
+    existing_keys = [c for c in key_cols if c in df_data.columns]
+    if existing_keys:
+        df_data = df_data.dropna(subset=existing_keys, how='all')
+
+    df_data['source_sheet'] = sheet_name
+    df_data['project_id'] = metadata.get('project_id', '')
+
+    if verbose:
+        print(f"    Found {len(df_data)} external estimate entries")
+
+    return {
+        'external_estimate': df_data,
+        'row_count': len(df_data),
+    }
+
+
+def process_media_sheet(
+    df: pd.DataFrame,
+    sheet_name: str,
+    header_row: int,
+    metadata: dict,
+    verbose: bool = False
+) -> dict:
+    """Process a Media plan/buy sheet."""
+    df_data = df.iloc[header_row + 1:].copy()
+    df_data.columns = df.iloc[header_row].values
+
+    col_map = {col: normalize_column_name(col) for col in df_data.columns}
+    df_data = df_data.rename(columns=col_map)
+
+    # Remove completely empty rows
+    df_data = df_data.dropna(how='all')
+
+    df_data['source_sheet'] = sheet_name
+    df_data['project_id'] = metadata.get('project_id', '')
+
+    if verbose:
+        print(f"    Found {len(df_data)} media entries")
+
+    return {
+        'media': df_data,
         'row_count': len(df_data),
     }
 
@@ -921,6 +1038,22 @@ def process_workbook_with_selections(
                     results['costs'].append(result['costs'])
                     print(f"    Processed {result['row_count']} cost entries")
 
+            elif sheet_type == 'investment_log':
+                result = process_investment_log_sheet(df, sheet_name, header_row, sheet_metadata, verbose)
+                print(f"    Processed {result['row_count']} investment log entries")
+
+            elif sheet_type == 'external_estimate':
+                result = process_external_estimate_sheet(df, sheet_name, header_row, sheet_metadata, verbose)
+                print(f"    Processed {result['row_count']} external estimate entries")
+
+            elif sheet_type == 'media':
+                result = process_media_sheet(df, sheet_name, header_row, sheet_metadata, verbose)
+                print(f"    Processed {result['row_count']} media entries")
+
+            else:
+                print(f"    Skipping unknown sheet type: {sheet_type}")
+                result = {'row_count': 0}
+
             results['processing_log'].append({
                 'sheet': sheet_name,
                 'type': sheet_type,
@@ -1088,6 +1221,22 @@ def process_workbook(
                 if 'costs' in result and len(result['costs']) > 0:
                     results['costs'].append(result['costs'])
                     print(f"    Processed {result['row_count']} cost entries")
+
+            elif sheet_type == 'investment_log':
+                result = process_investment_log_sheet(df, sheet_name, header_row, metadata, verbose)
+                print(f"    Processed {result['row_count']} investment log entries")
+
+            elif sheet_type == 'external_estimate':
+                result = process_external_estimate_sheet(df, sheet_name, header_row, metadata, verbose)
+                print(f"    Processed {result['row_count']} external estimate entries")
+
+            elif sheet_type == 'media':
+                result = process_media_sheet(df, sheet_name, header_row, metadata, verbose)
+                print(f"    Processed {result['row_count']} media entries")
+
+            else:
+                print(f"    Skipping unhandled sheet type: {sheet_type}")
+                result = {'row_count': 0}
 
             results['processing_log'].append({
                 'sheet': sheet_name,
