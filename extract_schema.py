@@ -60,7 +60,7 @@ def detect_data_header_row(df):
     best_row = -1
     best_score = 0
 
-    for idx in range(min(40, len(df))):
+    for idx in range(min(60, len(df))):
         row = df.iloc[idx]
         non_null = row.dropna()
         if len(non_null) < 4:
