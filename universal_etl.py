@@ -14,15 +14,24 @@ Supports:
 - External Estimate sheets
 
 Usage:
-  python3 universal_etl.py <excel_file> <project_id> <dataset_id> [options]
+  python3 universal_etl.py <excel_file> [options]
 
 Options:
+  --interactive     Interactive mode: confirm sheets and metadata before processing
   --dry-run         Process without uploading to BigQuery
   --output-csv      Output processed data to CSV files
   --client-name     Client name for project identification
   --project-title   Project title for identification
   --year            Fiscal year for the data
   --verbose         Show detailed processing info
+
+Examples:
+  # Interactive mode (recommended for new files)
+  python3 universal_etl.py "client_file.xlsx" --interactive --output-csv
+
+  # Batch mode with known metadata
+  python3 universal_etl.py "client_file.xlsx" my-gcp-project dataset_id \\
+    --client-name "Acme Corp" --project-title "2025 Platform"
 """
 
 import argparse
@@ -568,7 +577,403 @@ def extract_sheet_metadata(df: pd.DataFrame, header_row: int) -> dict:
 
 
 # =============================================================================
-# MAIN ETL ORCHESTRATOR
+# INTERACTIVE MODE FUNCTIONS
+# =============================================================================
+
+def print_sheet_summary(xlsx: pd.ExcelFile) -> list:
+    """Print a summary of all sheets with auto-detected types."""
+    print("\n" + "=" * 70)
+    print("SHEET DETECTION SUMMARY")
+    print("=" * 70)
+    print(f"{'#':<4} {'Sheet Name':<40} {'Detected Type':<15} {'Rows':<8}")
+    print("-" * 70)
+
+    sheet_info = []
+    for idx, sheet_name in enumerate(xlsx.sheet_names, 1):
+        detected_type = detect_sheet_type(sheet_name)
+
+        # Quick row count
+        try:
+            df = pd.read_excel(xlsx, sheet_name=sheet_name, header=None, nrows=5)
+            row_count = len(pd.read_excel(xlsx, sheet_name=sheet_name, header=None))
+        except:
+            row_count = 0
+
+        sheet_info.append({
+            'index': idx,
+            'name': sheet_name,
+            'detected_type': detected_type,
+            'row_count': row_count,
+            'selected': detected_type not in ['skip', 'unknown', 'mapping', 'info'],
+        })
+
+        # Color coding for terminal
+        type_display = detected_type.upper() if detected_type not in ['skip', 'unknown'] else f"({detected_type})"
+        name_display = sheet_name[:38] + '..' if len(sheet_name) > 40 else sheet_name
+
+        print(f"{idx:<4} {name_display:<40} {type_display:<15} {row_count:<8}")
+
+    print("-" * 70)
+    return sheet_info
+
+
+def interactive_sheet_selection(sheet_info: list) -> list:
+    """Let user confirm or modify sheet selections and types."""
+    print("\n" + "=" * 70)
+    print("SHEET SELECTION")
+    print("=" * 70)
+    print("Review the detected sheet types above. You can:")
+    print("  - Press ENTER to accept all detected types")
+    print("  - Enter sheet numbers to toggle selection (e.g., '1,3,5' or '1-5')")
+    print("  - Enter 'c' to change a sheet's type")
+    print("  - Enter 's' to skip all and select manually")
+    print("-" * 70)
+
+    # Show currently selected
+    selected = [s for s in sheet_info if s['selected']]
+    print(f"\nCurrently selected for processing ({len(selected)} sheets):")
+    for s in selected:
+        print(f"  [{s['index']}] {s['name']} -> {s['detected_type']}")
+
+    while True:
+        response = input("\nAction (ENTER=accept, numbers=toggle, c=change type, s=manual): ").strip().lower()
+
+        if response == '':
+            # Accept current selection
+            break
+
+        elif response == 's':
+            # Deselect all, let user pick
+            for s in sheet_info:
+                s['selected'] = False
+            nums = input("Enter sheet numbers to select (e.g., 1,3,5 or 1-5): ").strip()
+            indices = parse_number_input(nums)
+            for s in sheet_info:
+                if s['index'] in indices:
+                    s['selected'] = True
+            break
+
+        elif response == 'c':
+            # Change type
+            num = input("Enter sheet number to change type: ").strip()
+            try:
+                idx = int(num)
+                sheet = next((s for s in sheet_info if s['index'] == idx), None)
+                if sheet:
+                    print(f"Current type for '{sheet['name']}': {sheet['detected_type']}")
+                    print("Available types: plan, rate_card, actuals, costs, investment_log, external_estimate, skip")
+                    new_type = input("New type: ").strip().lower()
+                    if new_type in ['plan', 'rate_card', 'actuals', 'costs', 'investment_log', 'external_estimate', 'skip']:
+                        sheet['detected_type'] = new_type
+                        sheet['selected'] = new_type != 'skip'
+                        print(f"  Updated to: {new_type}")
+            except ValueError:
+                print("Invalid input")
+
+        else:
+            # Toggle selection by numbers
+            indices = parse_number_input(response)
+            for s in sheet_info:
+                if s['index'] in indices:
+                    s['selected'] = not s['selected']
+
+            # Show updated selection
+            selected = [s for s in sheet_info if s['selected']]
+            print(f"\nUpdated selection ({len(selected)} sheets):")
+            for s in selected:
+                print(f"  [{s['index']}] {s['name']} -> {s['detected_type']}")
+
+    return sheet_info
+
+
+def parse_number_input(s: str) -> list:
+    """Parse input like '1,3,5' or '1-5' or '1,3-5,7' into list of integers."""
+    indices = []
+    for part in s.replace(' ', '').split(','):
+        if '-' in part:
+            try:
+                start, end = part.split('-')
+                indices.extend(range(int(start), int(end) + 1))
+            except:
+                pass
+        else:
+            try:
+                indices.append(int(part))
+            except:
+                pass
+    return indices
+
+
+def interactive_metadata_input(file_name: str) -> dict:
+    """Prompt user for project metadata."""
+    print("\n" + "=" * 70)
+    print("PROJECT METADATA")
+    print("=" * 70)
+    print("Enter project information (press ENTER to skip optional fields):")
+    print("-" * 70)
+
+    # Try to extract hints from filename
+    year_match = re.search(r'20\d{2}', file_name)
+    suggested_year = year_match.group() if year_match else str(datetime.now().year)
+
+    client_name = input(f"Client name: ").strip()
+    project_title = input(f"Project title: ").strip()
+    year = input(f"Fiscal year [{suggested_year}]: ").strip() or suggested_year
+
+    try:
+        year = int(year)
+    except:
+        year = datetime.now().year
+
+    return {
+        'client_name': client_name,
+        'project_title': project_title,
+        'year': year,
+    }
+
+
+def show_processing_preview(sheet_info: list, metadata: dict, xlsx: pd.ExcelFile) -> bool:
+    """Show preview of what will be processed and confirm."""
+    print("\n" + "=" * 70)
+    print("PROCESSING PREVIEW")
+    print("=" * 70)
+
+    print(f"\nProject: {metadata.get('client_name', 'Unknown')} - {metadata.get('project_title', 'Unknown')}")
+    print(f"Year: {metadata.get('year', 'Unknown')}")
+
+    selected = [s for s in sheet_info if s['selected']]
+    print(f"\nSheets to process ({len(selected)}):")
+    print("-" * 50)
+
+    for s in selected:
+        sheet_name = s['name']
+        sheet_type = s['detected_type']
+
+        # Quick header detection preview
+        try:
+            df = pd.read_excel(xlsx, sheet_name=sheet_name, header=None)
+            header_row = find_header_row(df, sheet_type)
+            if header_row >= 0:
+                headers = df.iloc[header_row].dropna().tolist()[:8]
+                headers_str = ', '.join(str(h)[:20] for h in headers)
+                print(f"\n  [{s['index']}] {sheet_name}")
+                print(f"      Type: {sheet_type.upper()}")
+                print(f"      Header row: {header_row + 1}")
+                print(f"      Columns: {headers_str}...")
+                print(f"      Data rows: ~{s['row_count'] - header_row - 1}")
+            else:
+                print(f"\n  [{s['index']}] {sheet_name}")
+                print(f"      Type: {sheet_type.upper()}")
+                print(f"      WARNING: Could not detect header row")
+        except Exception as e:
+            print(f"\n  [{s['index']}] {sheet_name}")
+            print(f"      ERROR reading sheet: {str(e)}")
+
+    print("\n" + "-" * 70)
+    confirm = input("Proceed with processing? (y/n): ").strip().lower()
+    return confirm in ['y', 'yes', '']
+
+
+def run_interactive_mode(file_path: str) -> Optional[dict]:
+    """Run the ETL in interactive mode with user confirmation."""
+    print("\n" + "=" * 70)
+    print("UNIVERSAL FINANCIAL ETL - INTERACTIVE MODE")
+    print("=" * 70)
+
+    file_name = Path(file_path).name
+    print(f"\nFile: {file_name}")
+
+    # Load workbook
+    try:
+        xlsx = pd.ExcelFile(file_path, engine='openpyxl')
+    except Exception as e:
+        print(f"ERROR: Could not open file: {str(e)}")
+        return None
+
+    # Step 1: Show sheet summary
+    sheet_info = print_sheet_summary(xlsx)
+
+    # Step 2: Let user confirm/modify selection
+    sheet_info = interactive_sheet_selection(sheet_info)
+
+    selected = [s for s in sheet_info if s['selected']]
+    if not selected:
+        print("\nNo sheets selected. Exiting.")
+        return None
+
+    # Step 3: Get metadata
+    metadata = interactive_metadata_input(file_name)
+
+    # Step 4: Show preview and confirm
+    if not show_processing_preview(sheet_info, metadata, xlsx):
+        print("\nCancelled.")
+        return None
+
+    # Step 5: Process selected sheets
+    return process_workbook_with_selections(
+        xlsx,
+        sheet_info,
+        metadata,
+        file_name,
+        verbose=True
+    )
+
+
+def process_workbook_with_selections(
+    xlsx: pd.ExcelFile,
+    sheet_info: list,
+    metadata: dict,
+    file_name: str,
+    verbose: bool = False
+) -> dict:
+    """Process workbook with user-confirmed sheet selections."""
+    results = {
+        'allocations': [],
+        'rate_cards': [],
+        'actuals': [],
+        'costs': [],
+        'projects': [],
+        'processing_log': [],
+    }
+
+    print("\n" + "=" * 70)
+    print("PROCESSING")
+    print("=" * 70)
+
+    base_metadata = {
+        'client_name': metadata.get('client_name', ''),
+        'project_title': metadata.get('project_title', ''),
+        'source_file': file_name,
+        'year': metadata.get('year', datetime.now().year),
+    }
+
+    selected = [s for s in sheet_info if s['selected']]
+
+    for s in selected:
+        sheet_name = s['name']
+        sheet_type = s['detected_type']
+
+        print(f"\n[{sheet_type.upper()}] {sheet_name}")
+
+        df = pd.read_excel(xlsx, sheet_name=sheet_name, header=None)
+
+        if len(df) == 0:
+            print("    Empty sheet, skipping")
+            continue
+
+        header_row = find_header_row(df, sheet_type)
+
+        if header_row < 0:
+            print(f"    Could not find header row, skipping")
+            results['processing_log'].append({
+                'sheet': sheet_name,
+                'type': sheet_type,
+                'status': 'error',
+                'message': 'Could not find header row',
+            })
+            continue
+
+        print(f"    Header at row {header_row + 1}")
+
+        sheet_metadata = base_metadata.copy()
+        sheet_metadata['project_id'] = generate_project_id(
+            base_metadata['client_name'],
+            base_metadata['project_title'],
+            file_name,
+            sheet_name
+        )
+        sheet_metadata['source_sheet'] = sheet_name
+
+        try:
+            if sheet_type == 'plan':
+                result = process_plan_sheet(df, sheet_name, header_row, sheet_metadata, verbose)
+                if 'allocations' in result and len(result['allocations']) > 0:
+                    results['allocations'].append(result['allocations'])
+                    print(f"    Processed {result['row_count']} allocation records")
+
+                project_record = {
+                    'project_id': sheet_metadata['project_id'],
+                    'client_name': base_metadata['client_name'],
+                    'project_title': base_metadata['project_title'],
+                    'source_file': file_name,
+                    'source_sheet': sheet_name,
+                    'year': base_metadata['year'],
+                    'sheet_metadata': json.dumps(result.get('metadata', {})),
+                    'processed_at': datetime.now().isoformat(),
+                }
+                results['projects'].append(project_record)
+
+            elif sheet_type == 'rate_card':
+                result = process_rate_card_sheet(df, sheet_name, header_row, sheet_metadata, verbose)
+                if 'rate_card' in result and len(result['rate_card']) > 0:
+                    results['rate_cards'].append(result['rate_card'])
+                    print(f"    Processed {result['row_count']} rate card entries")
+
+            elif sheet_type == 'actuals':
+                result = process_actuals_sheet(df, sheet_name, header_row, sheet_metadata, verbose)
+                if 'actuals' in result and len(result['actuals']) > 0:
+                    results['actuals'].append(result['actuals'])
+                    print(f"    Processed {result['row_count']} actuals records")
+
+            elif sheet_type == 'costs':
+                result = process_costs_sheet(df, sheet_name, header_row, sheet_metadata, verbose)
+                if 'costs' in result and len(result['costs']) > 0:
+                    results['costs'].append(result['costs'])
+                    print(f"    Processed {result['row_count']} cost entries")
+
+            results['processing_log'].append({
+                'sheet': sheet_name,
+                'type': sheet_type,
+                'status': 'success',
+                'row_count': result.get('row_count', 0),
+            })
+
+        except Exception as e:
+            print(f"    ERROR: {str(e)}")
+            import traceback
+            if verbose:
+                traceback.print_exc()
+            results['processing_log'].append({
+                'sheet': sheet_name,
+                'type': sheet_type,
+                'status': 'error',
+                'message': str(e),
+            })
+
+    # Combine results
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+
+    if results['allocations']:
+        results['allocations_combined'] = pd.concat(results['allocations'], ignore_index=True)
+        print(f"Total allocations: {len(results['allocations_combined'])} rows")
+    else:
+        print("Total allocations: 0 rows")
+
+    if results['rate_cards']:
+        results['rate_cards_combined'] = pd.concat(results['rate_cards'], ignore_index=True)
+        print(f"Total rate card entries: {len(results['rate_cards_combined'])} rows")
+    else:
+        print("Total rate card entries: 0 rows")
+
+    if results['actuals']:
+        results['actuals_combined'] = pd.concat(results['actuals'], ignore_index=True)
+        print(f"Total actuals: {len(results['actuals_combined'])} rows")
+    else:
+        print("Total actuals: 0 rows")
+
+    if results['costs']:
+        results['costs_combined'] = pd.concat(results['costs'], ignore_index=True)
+        print(f"Total costs: {len(results['costs_combined'])} rows")
+    else:
+        print("Total costs: 0 rows")
+
+    return results
+
+
+# =============================================================================
+# MAIN ETL ORCHESTRATOR (BATCH MODE)
 # =============================================================================
 
 def process_workbook(
@@ -815,6 +1220,8 @@ def main():
     parser.add_argument('excel_file', help='Path to Excel file')
     parser.add_argument('gcp_project', nargs='?', help='GCP project ID')
     parser.add_argument('dataset_id', nargs='?', help='BigQuery dataset ID')
+    parser.add_argument('--interactive', '-i', action='store_true',
+                        help='Interactive mode: confirm sheets and metadata before processing')
     parser.add_argument('--dry-run', action='store_true', help='Process without uploading')
     parser.add_argument('--output-csv', action='store_true', help='Output to CSV files')
     parser.add_argument('--client-name', default='', help='Client name')
@@ -824,26 +1231,32 @@ def main():
 
     args = parser.parse_args()
 
-    # Process workbook
-    results = process_workbook(
-        args.excel_file,
-        client_name=args.client_name,
-        project_title=args.project_title,
-        year=args.year,
-        verbose=args.verbose,
-    )
+    # Interactive mode
+    if args.interactive:
+        results = run_interactive_mode(args.excel_file)
+        if results is None:
+            sys.exit(1)
+    else:
+        # Batch mode
+        results = process_workbook(
+            args.excel_file,
+            client_name=args.client_name,
+            project_title=args.project_title,
+            year=args.year,
+            verbose=args.verbose,
+        )
 
     # Output
     if args.output_csv:
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("OUTPUTTING TO CSV")
-        print("=" * 60)
+        print("=" * 70)
         output_to_csv(results)
 
     if not args.dry_run and args.gcp_project and args.dataset_id:
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("UPLOADING TO BIGQUERY")
-        print("=" * 60)
+        print("=" * 70)
         upload_to_bigquery(results, args.gcp_project, args.dataset_id, args.verbose)
     elif not args.dry_run and not args.output_csv:
         print("\nNo output specified. Use --dry-run, --output-csv, or provide GCP project/dataset.")
