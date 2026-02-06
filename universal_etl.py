@@ -333,6 +333,24 @@ def generate_project_id(client_name: str, project_title: str, source_file: str, 
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
+def safe_json_serialize(obj):
+    """Convert an object to JSON-safe format, handling datetime and other special types."""
+    if isinstance(obj, dict):
+        return {k: safe_json_serialize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [safe_json_serialize(v) for v in obj]
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    elif pd.isna(obj):
+        return None
+    elif isinstance(obj, (int, float, str, bool, type(None))):
+        return obj
+    else:
+        return str(obj)
+
+
 # =============================================================================
 # SHEET PROCESSORS
 # =============================================================================
@@ -469,7 +487,21 @@ def process_rate_card_sheet(
     """
     # Set header and get data
     df_data = df.iloc[header_row + 1:].copy()
-    df_data.columns = df.iloc[header_row].values
+    raw_columns = df.iloc[header_row].values
+
+    # Make column names unique (handle duplicates)
+    seen = {}
+    unique_columns = []
+    for col in raw_columns:
+        col_str = str(col) if pd.notna(col) else 'unnamed'
+        if col_str in seen:
+            seen[col_str] += 1
+            unique_columns.append(f"{col_str}_{seen[col_str]}")
+        else:
+            seen[col_str] = 0
+            unique_columns.append(col_str)
+
+    df_data.columns = unique_columns
 
     # Normalize column names
     col_map = {col: normalize_column_name(col) for col in df_data.columns}
@@ -1174,7 +1206,7 @@ def process_workbook_with_selections(
                     'total_hours': financial_summary.get('total_hours'),
                     'estimated_gross_margin': financial_summary.get('estimated_gross_margin'),
                     # Full metadata JSON for anything else
-                    'sheet_metadata_json': json.dumps(sheet_meta),
+                    'sheet_metadata_json': json.dumps(safe_json_serialize(sheet_meta)),
                     'processed_at': datetime.now().isoformat(),
                 }
                 results['projects'].append(project_record)
@@ -1388,7 +1420,7 @@ def process_workbook(
                     'total_hours': financial_summary.get('total_hours'),
                     'estimated_gross_margin': financial_summary.get('estimated_gross_margin'),
                     # Full metadata JSON for anything else
-                    'sheet_metadata_json': json.dumps(sheet_meta),
+                    'sheet_metadata_json': json.dumps(safe_json_serialize(sheet_meta)),
                     'processed_at': datetime.now().isoformat(),
                 }
                 results['projects'].append(project_record)
