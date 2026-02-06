@@ -724,6 +724,300 @@ resource "google_bigquery_table" "ingestion_log" {
 }
 
 # -----------------------------------------------------------------------------
+# Table: costs
+# Non-labor costs and expenses
+# -----------------------------------------------------------------------------
+
+resource "google_bigquery_table" "costs" {
+  dataset_id          = google_bigquery_dataset.delivery_finance.dataset_id
+  table_id            = "costs"
+  deletion_protection = false
+
+  schema = jsonencode([
+    {
+      name        = "cost_id"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Unique cost record identifier"
+    },
+    {
+      name        = "project_id"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Foreign key to projects table"
+    },
+    {
+      name        = "item"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Cost item name"
+    },
+    {
+      name        = "category"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Cost category"
+    },
+    {
+      name        = "vendor"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Vendor name"
+    },
+    {
+      name        = "cost_type"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Type: Passthrough, Investment, Billable"
+    },
+    {
+      name        = "estimate_actual"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Whether this is an Estimate or Actual"
+    },
+    {
+      name        = "amount"
+      type        = "FLOAT64"
+      mode        = "NULLABLE"
+      description = "Cost amount"
+    },
+    {
+      name        = "cost_date"
+      type        = "DATE"
+      mode        = "NULLABLE"
+      description = "Date of cost"
+    },
+    {
+      name        = "notes"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Notes/description"
+    },
+    {
+      name        = "source_file"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Source Excel file"
+    },
+    {
+      name        = "source_sheet"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Source sheet/tab name"
+    },
+    {
+      name        = "ingested_at"
+      type        = "TIMESTAMP"
+      mode        = "REQUIRED"
+      description = "Timestamp when record was ingested"
+    }
+  ])
+
+  labels = {
+    data_type = "transactional"
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Table: chat_history
+# Store conversation history for context
+# -----------------------------------------------------------------------------
+
+resource "google_bigquery_table" "chat_history" {
+  dataset_id          = google_bigquery_dataset.delivery_finance.dataset_id
+  table_id            = "chat_history"
+  deletion_protection = false
+
+  schema = jsonencode([
+    {
+      name        = "message_id"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Unique message identifier"
+    },
+    {
+      name        = "session_id"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Chat session identifier"
+    },
+    {
+      name        = "user_id"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "User identifier"
+    },
+    {
+      name        = "role"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Message role: user or assistant"
+    },
+    {
+      name        = "content"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Message content"
+    },
+    {
+      name        = "context_used"
+      type        = "JSON"
+      mode        = "NULLABLE"
+      description = "Projects/data referenced in response"
+    },
+    {
+      name        = "created_at"
+      type        = "TIMESTAMP"
+      mode        = "REQUIRED"
+      description = "Timestamp when message was created"
+    }
+  ])
+
+  labels = {
+    data_type = "audit"
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Enable Additional APIs for Cloud Run and Vertex AI
+# -----------------------------------------------------------------------------
+
+resource "google_project_service" "required_apis" {
+  for_each = toset([
+    "run.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "aiplatform.googleapis.com",
+    "secretmanager.googleapis.com",
+  ])
+
+  project            = var.project_id
+  service            = each.key
+  disable_on_destroy = false
+}
+
+# -----------------------------------------------------------------------------
+# Service Account for the App
+# -----------------------------------------------------------------------------
+
+resource "google_service_account" "app_sa" {
+  account_id   = "delivery-finance-app"
+  display_name = "Delivery Finance App Service Account"
+}
+
+resource "google_project_iam_member" "app_sa_roles" {
+  for_each = toset([
+    "roles/bigquery.dataEditor",
+    "roles/bigquery.jobUser",
+    "roles/aiplatform.user",
+    "roles/storage.objectViewer",
+    "roles/logging.logWriter",
+  ])
+
+  project = var.project_id
+  role    = each.key
+  member  = "serviceAccount:${google_service_account.app_sa.email}"
+}
+
+# -----------------------------------------------------------------------------
+# Artifact Registry for Docker Images
+# -----------------------------------------------------------------------------
+
+resource "google_artifact_registry_repository" "app_repo" {
+  location      = var.region == "US" ? "us-central1" : var.region
+  repository_id = "delivery-finance-app"
+  description   = "Docker images for Delivery Finance App"
+  format        = "DOCKER"
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# -----------------------------------------------------------------------------
+# Cloud Run Service
+# -----------------------------------------------------------------------------
+
+variable "cloud_run_region" {
+  description = "Region for Cloud Run service"
+  type        = string
+  default     = "us-central1"
+}
+
+resource "google_cloud_run_v2_service" "app" {
+  name     = "delivery-finance-app"
+  location = var.cloud_run_region
+  ingress  = "INGRESS_TRAFFIC_ALL"
+
+  template {
+    service_account = google_service_account.app_sa.email
+
+    containers {
+      image = "${var.cloud_run_region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.app_repo.repository_id}/app:latest"
+
+      ports {
+        container_port = 8080
+      }
+
+      env {
+        name  = "GCP_PROJECT_ID"
+        value = var.project_id
+      }
+
+      env {
+        name  = "BQ_DATASET_ID"
+        value = google_bigquery_dataset.delivery_finance.dataset_id
+      }
+
+      env {
+        name  = "GEMINI_MODEL"
+        value = "gemini-1.5-pro"
+      }
+
+      resources {
+        limits = {
+          cpu    = "2"
+          memory = "2Gi"
+        }
+      }
+
+      startup_probe {
+        http_get {
+          path = "/"
+        }
+        initial_delay_seconds = 10
+        period_seconds        = 10
+        failure_threshold     = 3
+      }
+    }
+
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 5
+    }
+  }
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_artifact_registry_repository.app_repo,
+  ]
+
+  lifecycle {
+    ignore_changes = [
+      template[0].containers[0].image,
+    ]
+  }
+}
+
+# Allow unauthenticated access (or remove this for authenticated only)
+resource "google_cloud_run_v2_service_iam_member" "public_access" {
+  project  = var.project_id
+  location = google_cloud_run_v2_service.app.location
+  name     = google_cloud_run_v2_service.app.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+# -----------------------------------------------------------------------------
 # Outputs
 # -----------------------------------------------------------------------------
 
@@ -739,7 +1033,24 @@ output "table_ids" {
     project_scope_docs = google_bigquery_table.project_scope_docs.table_id
     allocations        = google_bigquery_table.allocations.table_id
     actuals            = google_bigquery_table.actuals.table_id
+    costs              = google_bigquery_table.costs.table_id
     ingestion_log      = google_bigquery_table.ingestion_log.table_id
+    chat_history       = google_bigquery_table.chat_history.table_id
   }
   description = "BigQuery Table IDs"
+}
+
+output "service_account_email" {
+  value       = google_service_account.app_sa.email
+  description = "Service Account Email"
+}
+
+output "artifact_registry_url" {
+  value       = "${var.cloud_run_region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.app_repo.repository_id}"
+  description = "Artifact Registry URL for Docker images"
+}
+
+output "cloud_run_url" {
+  value       = google_cloud_run_v2_service.app.uri
+  description = "Cloud Run Service URL"
 }
