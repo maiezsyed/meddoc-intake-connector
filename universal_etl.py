@@ -658,37 +658,172 @@ def process_media_sheet(
 
 
 def extract_sheet_metadata(df: pd.DataFrame, header_row: int) -> dict:
-    """Extract metadata from rows above the data header."""
-    metadata = {}
-
-    # Common metadata labels to look for
-    metadata_labels = {
-        'client': ['client', 'client (info)'],
-        'project_title': ['project title', 'project title (info)', 'project'],
-        'project_number': ['project number', 'project number (info)'],
-        'start_date': ['start date', 'start date (required)'],
-        'billing_type': ['billing type', 'billing type (info)'],
-        'market': ['market (required)', 'market'],
-        'rate_card': ['rate card', 'rate card (required)'],
-        'total_project_fee': ['total project fee'],
-        'gross_margin': ['estimated gross margin'],
+    """
+    Extract comprehensive metadata from rows above the data header.
+    Captures project info, financial summaries, and configuration.
+    """
+    metadata = {
+        'project_info': {},
+        'financial_summary': {},
+        'configuration': {},
+        'raw_metadata': [],  # Store all label-value pairs found
     }
 
-    for idx in range(min(header_row, 40)):
+    # Known labels and their canonical keys
+    # Format: 'label pattern' -> ('category', 'key_name')
+    known_labels = {
+        # Project identification
+        'client': ('project_info', 'client'),
+        'client (info)': ('project_info', 'client'),
+        'project title': ('project_info', 'project_title'),
+        'project title (info)': ('project_info', 'project_title'),
+        'project number': ('project_info', 'project_number'),
+        'project number (info)': ('project_info', 'project_number'),
+
+        # Dates
+        'start date': ('project_info', 'start_date'),
+        'start date (required)': ('project_info', 'start_date'),
+        'end date': ('project_info', 'end_date'),
+
+        # Configuration
+        'market': ('configuration', 'market'),
+        'market (required)': ('configuration', 'market'),
+        'company': ('configuration', 'company'),
+        'company (required)': ('configuration', 'company'),
+        'rate card': ('configuration', 'rate_card'),
+        'rate card (required)': ('configuration', 'rate_card'),
+        'billing type': ('configuration', 'billing_type'),
+        'billing type (info)': ('configuration', 'billing_type'),
+        'hour mode': ('configuration', 'hour_mode'),
+
+        # Financial summaries
+        'total project fee': ('financial_summary', 'total_project_fee'),
+        'estimated gross margin': ('financial_summary', 'estimated_gross_margin'),
+        'target gm%': ('financial_summary', 'target_gm_pct'),
+        'target gm% / fee': ('financial_summary', 'target_gm_pct'),
+        'billable labor fees': ('financial_summary', 'billable_labor_fees'),
+        'additional billable fees': ('financial_summary', 'additional_billable_fees'),
+        'passthrough': ('financial_summary', 'passthrough'),
+        'labor costs': ('financial_summary', 'labor_costs'),
+        'investment costs': ('financial_summary', 'investment_costs'),
+        'total hours': ('financial_summary', 'total_hours'),
+        'total cost': ('financial_summary', 'total_cost'),
+        'gross margin': ('financial_summary', 'gross_margin'),
+
+        # Overrides/options
+        'fixed fee': ('configuration', 'fixed_fee'),
+        'fixed fee (optional)': ('configuration', 'fixed_fee'),
+        'fixed % discount': ('configuration', 'fixed_discount_pct'),
+        'blended rate': ('configuration', 'blended_rate'),
+    }
+
+    # Also look for these patterns that might have values in adjacent cells
+    value_patterns = [
+        'weekly (fixed 40)', 'weekly (fixed 35)', 'monthly (fixed 150)',
+        'fixed fee', 't&m', 'retainer', 'hybrid',
+    ]
+
+    # Scan metadata rows
+    for idx in range(min(header_row, 50)):
         row = df.iloc[idx]
-        for col_idx, val in enumerate(row):
-            if pd.isna(val) or not isinstance(val, str):
+
+        for col_idx in range(min(len(row), 30)):  # Check first 30 columns
+            val = row.iloc[col_idx]
+
+            if pd.isna(val):
                 continue
 
-            val_lower = val.lower().strip()
+            # Check if it's a string label
+            if isinstance(val, str):
+                val_lower = val.lower().strip()
 
-            for meta_key, labels in metadata_labels.items():
-                if val_lower in labels:
-                    # Try to get value from next column
-                    if col_idx + 1 < len(row):
-                        next_val = row.iloc[col_idx + 1]
-                        if pd.notna(next_val):
-                            metadata[meta_key] = next_val
+                # Check against known labels
+                for label_pattern, (category, key_name) in known_labels.items():
+                    if label_pattern in val_lower or val_lower == label_pattern:
+                        # Try to get value from next column
+                        if col_idx + 1 < len(row):
+                            next_val = row.iloc[col_idx + 1]
+                            if pd.notna(next_val):
+                                metadata[category][key_name] = next_val
+                                metadata['raw_metadata'].append({
+                                    'row': idx + 1,
+                                    'label': val,
+                                    'value': next_val,
+                                    'category': category,
+                                    'key': key_name,
+                                })
+                        break
+
+                # Check for value patterns (these ARE the value, not a label)
+                for pattern in value_patterns:
+                    if pattern in val_lower:
+                        # This is likely a configuration value
+                        if 'weekly' in val_lower or 'monthly' in val_lower:
+                            metadata['configuration']['hour_mode'] = val
+                        elif val_lower in ['fixed fee', 't&m', 'retainer', 'hybrid']:
+                            metadata['configuration']['billing_type'] = val
+                        metadata['raw_metadata'].append({
+                            'row': idx + 1,
+                            'label': 'detected_value',
+                            'value': val,
+                        })
+                        break
+
+            # Check for market codes (short uppercase strings in specific columns)
+            elif isinstance(val, str) and len(val) <= 10 and val.isupper():
+                # Could be a market code like DPUS, CXUS, AMER, etc.
+                if val in ['DPUS', 'CXUS', 'EXUS', 'MTUS', 'AMER', 'EMEA', 'APAC', 'LATAM']:
+                    if 'market' not in metadata['configuration']:
+                        metadata['configuration']['market'] = val
+                    metadata['raw_metadata'].append({
+                        'row': idx + 1,
+                        'label': 'market_code',
+                        'value': val,
+                    })
+
+            # Capture financial numbers that appear with labels
+            # Look for patterns where col 0 has a label and col 1 has a number
+            if col_idx == 0 and isinstance(val, str):
+                if col_idx + 1 < len(row):
+                    next_val = row.iloc[col_idx + 1]
+                    if isinstance(next_val, (int, float)) and pd.notna(next_val):
+                        metadata['raw_metadata'].append({
+                            'row': idx + 1,
+                            'label': val,
+                            'value': next_val,
+                            'type': 'number',
+                        })
+
+    # Also check column 3-4 pattern (common in these sheets for fee summaries)
+    for idx in range(min(header_row, 50)):
+        row = df.iloc[idx]
+        if len(row) > 4:
+            label_val = row.iloc[3] if pd.notna(row.iloc[3]) else None
+            num_val = row.iloc[4] if len(row) > 4 and pd.notna(row.iloc[4]) else None
+
+            if isinstance(label_val, str) and isinstance(num_val, (int, float)):
+                label_lower = label_val.lower().strip()
+
+                # Map to financial summary
+                if 'billable' in label_lower and 'fee' in label_lower:
+                    metadata['financial_summary']['billable_fees'] = num_val
+                elif 'passthrough' in label_lower:
+                    metadata['financial_summary']['passthrough'] = num_val
+                elif 'investment' in label_lower:
+                    metadata['financial_summary']['investment_costs'] = num_val
+                elif 'total hours' in label_lower:
+                    metadata['financial_summary']['total_hours'] = num_val
+                elif 'total cost' in label_lower:
+                    metadata['financial_summary']['total_cost'] = num_val
+                elif 'labor cost' in label_lower:
+                    metadata['financial_summary']['labor_costs'] = num_val
+
+                metadata['raw_metadata'].append({
+                    'row': idx + 1,
+                    'col': 3,
+                    'label': label_val,
+                    'value': num_val,
+                })
 
     return metadata
 
@@ -1008,17 +1143,47 @@ def process_workbook_with_selections(
                     results['allocations'].append(result['allocations'])
                     print(f"    Processed {result['row_count']} allocation records")
 
+                # Build rich project record with extracted metadata
+                sheet_meta = result.get('metadata', {})
+                project_info = sheet_meta.get('project_info', {})
+                financial_summary = sheet_meta.get('financial_summary', {})
+                config = sheet_meta.get('configuration', {})
+
                 project_record = {
                     'project_id': sheet_metadata['project_id'],
-                    'client_name': base_metadata['client_name'],
-                    'project_title': base_metadata['project_title'],
+                    'client_name': project_info.get('client') or base_metadata['client_name'],
+                    'project_title': project_info.get('project_title') or base_metadata['project_title'],
+                    'project_number': project_info.get('project_number'),
                     'source_file': file_name,
                     'source_sheet': sheet_name,
                     'year': base_metadata['year'],
-                    'sheet_metadata': json.dumps(result.get('metadata', {})),
+                    # Configuration from sheet
+                    'market': config.get('market'),
+                    'billing_type': config.get('billing_type'),
+                    'hour_mode': config.get('hour_mode'),
+                    'rate_card_name': config.get('rate_card'),
+                    'start_date': str(project_info.get('start_date', '')) if project_info.get('start_date') else None,
+                    'end_date': str(project_info.get('end_date', '')) if project_info.get('end_date') else None,
+                    # Financial summary
+                    'total_project_fee': financial_summary.get('total_project_fee'),
+                    'billable_labor_fees': financial_summary.get('billable_labor_fees') or financial_summary.get('billable_fees'),
+                    'additional_billable_fees': financial_summary.get('additional_billable_fees'),
+                    'passthrough': financial_summary.get('passthrough'),
+                    'labor_costs': financial_summary.get('labor_costs'),
+                    'investment_costs': financial_summary.get('investment_costs'),
+                    'total_hours': financial_summary.get('total_hours'),
+                    'estimated_gross_margin': financial_summary.get('estimated_gross_margin'),
+                    # Full metadata JSON for anything else
+                    'sheet_metadata_json': json.dumps(sheet_meta),
                     'processed_at': datetime.now().isoformat(),
                 }
                 results['projects'].append(project_record)
+
+                if verbose:
+                    if config:
+                        print(f"    Config: market={config.get('market')}, billing={config.get('billing_type')}, hours={config.get('hour_mode')}")
+                    if financial_summary:
+                        print(f"    Financials: fee={financial_summary.get('total_project_fee')}, hours={financial_summary.get('total_hours')}")
 
             elif sheet_type == 'rate_card':
                 result = process_rate_card_sheet(df, sheet_name, header_row, sheet_metadata, verbose)
@@ -1192,17 +1357,47 @@ def process_workbook(
                     print(f"    Processed {result['row_count']} allocation records")
 
                 # Create project record
+                # Build rich project record with extracted metadata
+                sheet_meta = result.get('metadata', {})
+                project_info = sheet_meta.get('project_info', {})
+                financial_summary = sheet_meta.get('financial_summary', {})
+                config = sheet_meta.get('configuration', {})
+
                 project_record = {
                     'project_id': metadata['project_id'],
-                    'client_name': client_name,
-                    'project_title': project_title,
+                    'client_name': project_info.get('client') or client_name,
+                    'project_title': project_info.get('project_title') or project_title,
+                    'project_number': project_info.get('project_number'),
                     'source_file': file_name,
                     'source_sheet': sheet_name,
                     'year': year,
-                    'sheet_metadata': json.dumps(result.get('metadata', {})),
+                    # Configuration from sheet
+                    'market': config.get('market'),
+                    'billing_type': config.get('billing_type'),
+                    'hour_mode': config.get('hour_mode'),
+                    'rate_card_name': config.get('rate_card'),
+                    'start_date': str(project_info.get('start_date', '')) if project_info.get('start_date') else None,
+                    'end_date': str(project_info.get('end_date', '')) if project_info.get('end_date') else None,
+                    # Financial summary
+                    'total_project_fee': financial_summary.get('total_project_fee'),
+                    'billable_labor_fees': financial_summary.get('billable_labor_fees') or financial_summary.get('billable_fees'),
+                    'additional_billable_fees': financial_summary.get('additional_billable_fees'),
+                    'passthrough': financial_summary.get('passthrough'),
+                    'labor_costs': financial_summary.get('labor_costs'),
+                    'investment_costs': financial_summary.get('investment_costs'),
+                    'total_hours': financial_summary.get('total_hours'),
+                    'estimated_gross_margin': financial_summary.get('estimated_gross_margin'),
+                    # Full metadata JSON for anything else
+                    'sheet_metadata_json': json.dumps(sheet_meta),
                     'processed_at': datetime.now().isoformat(),
                 }
                 results['projects'].append(project_record)
+
+                if verbose:
+                    if config:
+                        print(f"    Config: market={config.get('market')}, billing={config.get('billing_type')}, hours={config.get('hour_mode')}")
+                    if financial_summary:
+                        print(f"    Financials: fee={financial_summary.get('total_project_fee')}, hours={financial_summary.get('total_hours')}")
 
             elif sheet_type == 'rate_card':
                 result = process_rate_card_sheet(df, sheet_name, header_row, metadata, verbose)
