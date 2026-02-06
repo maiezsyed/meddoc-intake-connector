@@ -368,14 +368,19 @@ def process_plan_sheet(
     """
     # Set header and get data
     df_data = df.iloc[header_row + 1:].copy()
-    df_data.columns = df.iloc[header_row].values
+    raw_columns = df.iloc[header_row].values
 
-    # Normalize column names
-    col_map = {col: normalize_column_name(col) for col in df_data.columns}
-    df_data = df_data.rename(columns=col_map)
+    # Track original column names before normalization for week column detection
+    original_columns = list(raw_columns)
 
-    # Identify dimension vs week columns
-    week_cols = identify_week_columns(df.iloc[header_row].values)
+    # Normalize column names, then make unique to handle duplicates
+    normalized_columns = [normalize_column_name(col) for col in raw_columns]
+    unique_columns = make_columns_unique(normalized_columns)
+    df_data.columns = unique_columns
+
+    # Build a mapping from unique normalized columns to their original values
+    # This helps us identify which columns are week columns
+    col_original_map = dict(zip(unique_columns, original_columns))
 
     # Core dimension columns we want to keep
     dimension_cols = [
@@ -385,8 +390,17 @@ def process_plan_sheet(
         'total_fees', 'total_cost', 'total_hours', 'margin_pct', 'discount_pct',
     ]
 
-    # Keep only columns that exist
-    existing_dims = [c for c in dimension_cols if c in df_data.columns]
+    # Keep only columns that exist (handle duplicates with suffixes)
+    existing_dims = []
+    for dim in dimension_cols:
+        if dim in df_data.columns:
+            existing_dims.append(dim)
+        # Also check for suffixed versions (dim_1, dim_2, etc.) but only add the first
+        elif any(col.startswith(dim + '_') and col[len(dim)+1:].isdigit() for col in df_data.columns):
+            for col in df_data.columns:
+                if col.startswith(dim + '_') and col[len(dim)+1:].isdigit():
+                    existing_dims.append(col)
+                    break
 
     # Filter out empty rows (no market/department/role)
     key_cols = ['market', 'department', 'role']
@@ -394,73 +408,77 @@ def process_plan_sheet(
     if existing_keys:
         df_data = df_data.dropna(subset=existing_keys, how='all')
 
-    if verbose:
-        print(f"    Found {len(df_data)} data rows")
-        print(f"    Dimension columns: {existing_dims}")
-        print(f"    Week columns: {len(week_cols)}")
-
     # Extract metadata from rows above header
     sheet_metadata = extract_sheet_metadata(df, header_row)
 
-    # Melt week columns into rows for allocations table
-    fee_week_cols = [(col, wk) for col, wk, typ in week_cols if typ == 'fee']
+    # Identify week columns from the CURRENT dataframe columns
+    # A week column is one whose original value was a week number (1-90)
+    week_col_in_data = []
+    for col in df_data.columns:
+        original = col_original_map.get(col)
+        if original is None:
+            continue
 
-    if fee_week_cols:
-        # Find week columns that exist in the data after column normalization
-        week_col_in_data = []
-        for col in df_data.columns:
-            col_str = str(col).strip()
-            # Check if it's a week number column (01-90 or 1-90)
-            if re.match(r'^(0?[1-9]|[1-8][0-9]|90)$', col_str):
-                week_col_in_data.append(col)
-            # Also check for integer columns
+        # Check original value for week number patterns
+        original_str = str(original).strip() if pd.notna(original) else ''
+
+        # Integer columns (1, 2, 3...)
+        if isinstance(original, (int, float)) and pd.notna(original):
             try:
-                if isinstance(col, (int, float)) and not pd.isna(col) and 1 <= int(col) <= 90:
-                    week_col_in_data.append(col)
+                if 1 <= int(original) <= 90:
+                    week_col_in_data.append((col, int(original)))
+                    continue
             except (ValueError, TypeError):
                 pass
 
-        if week_col_in_data:
-            # Melt the dataframe
-            id_vars = [c for c in existing_dims if c in df_data.columns]
+        # String columns ("01", "02", "1", "2"...)
+        if re.match(r'^(0?[1-9]|[1-8][0-9]|90)$', original_str):
+            week_num = int(original_str.lstrip('0') or '0')
+            if 1 <= week_num <= 90:
+                week_col_in_data.append((col, week_num))
 
-            try:
-                df_melted = pd.melt(
-                    df_data,
-                    id_vars=id_vars,
-                    value_vars=week_col_in_data,
-                    var_name='week_number',
-                    value_name='hours'
-                )
+    if verbose:
+        print(f"    Found {len(df_data)} data rows")
+        print(f"    Dimension columns: {existing_dims}")
+        print(f"    Week columns: {len(week_col_in_data)}")
 
-                # Convert week_number to int safely
-                def safe_week_num(x):
-                    try:
-                        match = re.match(r'^(\d+)', str(x).strip())
-                        if match:
-                            return int(match.group(1))
-                        return int(x)
-                    except:
-                        return 0
+    if week_col_in_data:
+        # Get just the column names for melting
+        week_col_names = [col for col, wk in week_col_in_data]
 
-                df_melted['week_number'] = df_melted['week_number'].apply(safe_week_num)
+        # Ensure id_vars and value_vars don't overlap
+        id_vars = [c for c in existing_dims if c in df_data.columns and c not in week_col_names]
 
-                # Filter out zero/null hours
-                df_melted = df_melted[df_melted['hours'].notna() & (df_melted['hours'] != 0)]
+        try:
+            df_melted = pd.melt(
+                df_data,
+                id_vars=id_vars,
+                value_vars=week_col_names,
+                var_name='week_col',
+                value_name='hours'
+            )
 
-                # Add metadata columns
-                df_melted['source_sheet'] = sheet_name
-                df_melted['project_id'] = metadata.get('project_id', '')
+            # Map week_col back to week number using our tracked mapping
+            week_col_to_num = {col: wk for col, wk in week_col_in_data}
+            df_melted['week_number'] = df_melted['week_col'].map(week_col_to_num)
+            df_melted = df_melted.drop(columns=['week_col'])
 
-                return {
-                    'allocations': df_melted,
-                    'metadata': sheet_metadata,
-                    'row_count': len(df_melted),
-                }
-            except Exception as e:
-                if verbose:
-                    print(f"    Warning: Could not melt week columns: {str(e)}")
-                # Fall through to return dimension data only
+            # Filter out zero/null hours
+            df_melted = df_melted[df_melted['hours'].notna() & (df_melted['hours'] != 0)]
+
+            # Add metadata columns
+            df_melted['source_sheet'] = sheet_name
+            df_melted['project_id'] = metadata.get('project_id', '')
+
+            return {
+                'allocations': df_melted,
+                'metadata': sheet_metadata,
+                'row_count': len(df_melted),
+            }
+        except Exception as e:
+            if verbose:
+                print(f"    Warning: Could not melt week columns: {str(e)}")
+            # Fall through to return dimension data only
 
     # If no week columns or melting failed, return dimension data only
     df_data['source_sheet'] = sheet_name
@@ -472,6 +490,24 @@ def process_plan_sheet(
         'metadata': sheet_metadata,
         'row_count': len(df_data),
     }
+
+
+def make_columns_unique(columns: list) -> list:
+    """
+    Make a list of column names unique by appending suffixes to duplicates.
+    Handles None/NaN values by converting to 'unnamed'.
+    """
+    seen = {}
+    unique_columns = []
+    for col in columns:
+        col_str = str(col) if pd.notna(col) else 'unnamed'
+        if col_str in seen:
+            seen[col_str] += 1
+            unique_columns.append(f"{col_str}_{seen[col_str]}")
+        else:
+            seen[col_str] = 0
+            unique_columns.append(col_str)
+    return unique_columns
 
 
 def process_rate_card_sheet(
@@ -489,23 +525,11 @@ def process_rate_card_sheet(
     df_data = df.iloc[header_row + 1:].copy()
     raw_columns = df.iloc[header_row].values
 
-    # Make column names unique (handle duplicates)
-    seen = {}
-    unique_columns = []
-    for col in raw_columns:
-        col_str = str(col) if pd.notna(col) else 'unnamed'
-        if col_str in seen:
-            seen[col_str] += 1
-            unique_columns.append(f"{col_str}_{seen[col_str]}")
-        else:
-            seen[col_str] = 0
-            unique_columns.append(col_str)
+    # First normalize, then make unique (to handle post-normalization duplicates)
+    normalized_columns = [normalize_column_name(col) for col in raw_columns]
+    unique_columns = make_columns_unique(normalized_columns)
 
     df_data.columns = unique_columns
-
-    # Normalize column names
-    col_map = {col: normalize_column_name(col) for col in df_data.columns}
-    df_data = df_data.rename(columns=col_map)
 
     # Remove empty rows
     if 'market' in df_data.columns:
@@ -543,10 +567,12 @@ def process_actuals_sheet(
 ) -> dict:
     """Process an Actuals/Timesheet sheet."""
     df_data = df.iloc[header_row + 1:].copy()
-    df_data.columns = df.iloc[header_row].values
+    raw_columns = df.iloc[header_row].values
 
-    col_map = {col: normalize_column_name(col) for col in df_data.columns}
-    df_data = df_data.rename(columns=col_map)
+    # Normalize then make unique
+    normalized_columns = [normalize_column_name(col) for col in raw_columns]
+    unique_columns = make_columns_unique(normalized_columns)
+    df_data.columns = unique_columns
 
     # Remove empty rows
     if 'employee_name' in df_data.columns:
@@ -575,10 +601,12 @@ def process_costs_sheet(
 ) -> dict:
     """Process a Costs/Expenses sheet."""
     df_data = df.iloc[header_row + 1:].copy()
-    df_data.columns = df.iloc[header_row].values
+    raw_columns = df.iloc[header_row].values
 
-    col_map = {col: normalize_column_name(col) for col in df_data.columns}
-    df_data = df_data.rename(columns=col_map)
+    # Normalize then make unique
+    normalized_columns = [normalize_column_name(col) for col in raw_columns]
+    unique_columns = make_columns_unique(normalized_columns)
+    df_data.columns = unique_columns
 
     # Remove empty rows
     if 'item' in df_data.columns:
@@ -605,10 +633,12 @@ def process_investment_log_sheet(
 ) -> dict:
     """Process an Investment Log sheet."""
     df_data = df.iloc[header_row + 1:].copy()
-    df_data.columns = df.iloc[header_row].values
+    raw_columns = df.iloc[header_row].values
 
-    col_map = {col: normalize_column_name(col) for col in df_data.columns}
-    df_data = df_data.rename(columns=col_map)
+    # Normalize then make unique
+    normalized_columns = [normalize_column_name(col) for col in raw_columns]
+    unique_columns = make_columns_unique(normalized_columns)
+    df_data.columns = unique_columns
 
     # Remove empty rows - check for any non-null value in key columns
     key_cols = ['investment_summary', 'investment_amount', 'date_identified']
@@ -637,10 +667,12 @@ def process_external_estimate_sheet(
 ) -> dict:
     """Process an External Estimate sheet (client-facing summary)."""
     df_data = df.iloc[header_row + 1:].copy()
-    df_data.columns = df.iloc[header_row].values
+    raw_columns = df.iloc[header_row].values
 
-    col_map = {col: normalize_column_name(col) for col in df_data.columns}
-    df_data = df_data.rename(columns=col_map)
+    # Normalize then make unique
+    normalized_columns = [normalize_column_name(col) for col in raw_columns]
+    unique_columns = make_columns_unique(normalized_columns)
+    df_data.columns = unique_columns
 
     # Remove empty rows
     key_cols = ['department', 'role', 'total_fee', 'est_total_hours']
@@ -669,10 +701,12 @@ def process_media_sheet(
 ) -> dict:
     """Process a Media plan/buy sheet."""
     df_data = df.iloc[header_row + 1:].copy()
-    df_data.columns = df.iloc[header_row].values
+    raw_columns = df.iloc[header_row].values
 
-    col_map = {col: normalize_column_name(col) for col in df_data.columns}
-    df_data = df_data.rename(columns=col_map)
+    # Normalize then make unique
+    normalized_columns = [normalize_column_name(col) for col in raw_columns]
+    unique_columns = make_columns_unique(normalized_columns)
+    df_data.columns = unique_columns
 
     # Remove completely empty rows
     df_data = df_data.dropna(how='all')
@@ -701,6 +735,35 @@ def extract_sheet_metadata(df: pd.DataFrame, header_row: int) -> dict:
         'raw_metadata': [],  # Store all label-value pairs found
     }
 
+    # Valid market codes (only accept these specific values)
+    VALID_MARKET_CODES = {
+        'DPUS', 'CXUS', 'EXUS', 'MTUS', 'AMER', 'EMEA', 'APAC', 'LATAM',
+        'NA', 'EU', 'UK', 'US', 'CA', 'AU', 'GLOBAL', 'CORP',
+    }
+
+    # Values that should NOT be accepted as market codes
+    INVALID_MARKET_VALUES = {
+        'total hours', 'total fees', 'total cost', 'gross margin',
+        'category', 'department', 'role', 'notes', 'employee',
+        'bill rate', 'cost rate', 'hours', 'fees', 'costs',
+    }
+
+    def is_valid_market_value(val):
+        """Check if a value is a valid market code."""
+        if pd.isna(val):
+            return False
+        val_str = str(val).strip().upper()
+        val_lower = str(val).strip().lower()
+        # Must be a known code or a short uppercase string (not a common label)
+        if val_str in VALID_MARKET_CODES:
+            return True
+        if val_lower in INVALID_MARKET_VALUES:
+            return False
+        # Accept short uppercase codes that look like market codes (2-6 chars)
+        if len(val_str) <= 6 and val_str.isalpha() and val_str.isupper():
+            return True
+        return False
+
     # Known labels and their canonical keys
     # Format: 'label pattern' -> ('category', 'key_name')
     known_labels = {
@@ -717,7 +780,7 @@ def extract_sheet_metadata(df: pd.DataFrame, header_row: int) -> dict:
         'start date (required)': ('project_info', 'start_date'),
         'end date': ('project_info', 'end_date'),
 
-        # Configuration
+        # Configuration - market requires special validation
         'market': ('configuration', 'market'),
         'market (required)': ('configuration', 'market'),
         'company': ('configuration', 'company'),
@@ -749,13 +812,16 @@ def extract_sheet_metadata(df: pd.DataFrame, header_row: int) -> dict:
         'blended rate': ('configuration', 'blended_rate'),
     }
 
+    # Labels that require special value validation
+    LABELS_REQUIRING_VALIDATION = {'market'}
+
     # Also look for these patterns that might have values in adjacent cells
     value_patterns = [
         'weekly (fixed 40)', 'weekly (fixed 35)', 'monthly (fixed 150)',
         'fixed fee', 't&m', 'retainer', 'hybrid',
     ]
 
-    # Scan metadata rows
+    # Scan metadata rows (only rows BEFORE the header, not the header itself)
     for idx in range(min(header_row, 50)):
         row = df.iloc[idx]
 
@@ -769,13 +835,19 @@ def extract_sheet_metadata(df: pd.DataFrame, header_row: int) -> dict:
             if isinstance(val, str):
                 val_lower = val.lower().strip()
 
-                # Check against known labels
+                # Check against known labels (exact match preferred)
                 for label_pattern, (category, key_name) in known_labels.items():
-                    if label_pattern in val_lower or val_lower == label_pattern:
+                    # Use exact match or contained match for labels
+                    if val_lower == label_pattern or (label_pattern in val_lower and len(val_lower) < 50):
                         # Try to get value from next column
                         if col_idx + 1 < len(row):
                             next_val = row.iloc[col_idx + 1]
                             if pd.notna(next_val):
+                                # Special validation for market field
+                                if key_name == 'market':
+                                    if not is_valid_market_value(next_val):
+                                        continue  # Skip invalid market values
+
                                 metadata[category][key_name] = next_val
                                 metadata['raw_metadata'].append({
                                     'row': idx + 1,
@@ -801,16 +873,16 @@ def extract_sheet_metadata(df: pd.DataFrame, header_row: int) -> dict:
                         })
                         break
 
-            # Check for market codes (short uppercase strings in specific columns)
-            elif isinstance(val, str) and len(val) <= 10 and val.isupper():
-                # Could be a market code like DPUS, CXUS, AMER, etc.
-                if val in ['DPUS', 'CXUS', 'EXUS', 'MTUS', 'AMER', 'EMEA', 'APAC', 'LATAM']:
+            # Check for standalone market codes (short uppercase strings)
+            if isinstance(val, str) and len(val) <= 10:
+                val_upper = val.strip().upper()
+                if val_upper in VALID_MARKET_CODES:
                     if 'market' not in metadata['configuration']:
-                        metadata['configuration']['market'] = val
+                        metadata['configuration']['market'] = val_upper
                     metadata['raw_metadata'].append({
                         'row': idx + 1,
                         'label': 'market_code',
-                        'value': val,
+                        'value': val_upper,
                     })
 
             # Capture financial numbers that appear with labels
