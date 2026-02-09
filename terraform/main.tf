@@ -921,6 +921,39 @@ resource "google_project_iam_member" "app_sa_roles" {
 }
 
 # -----------------------------------------------------------------------------
+# Cloud Build Permissions (to deploy Cloud Run)
+# -----------------------------------------------------------------------------
+
+# Get the Cloud Build service account
+data "google_project" "project" {
+  project_id = var.project_id
+}
+
+locals {
+  cloud_build_sa = "serviceAccount:${data.google_project.project.number}@cloudbuild.gserviceaccount.com"
+}
+
+# Cloud Build needs these roles to deploy to Cloud Run
+resource "google_project_iam_member" "cloudbuild_run_admin" {
+  project = var.project_id
+  role    = "roles/run.admin"
+  member  = local.cloud_build_sa
+}
+
+resource "google_project_iam_member" "cloudbuild_sa_user" {
+  project = var.project_id
+  role    = "roles/iam.serviceAccountUser"
+  member  = local.cloud_build_sa
+}
+
+# Allow Cloud Build to push to Artifact Registry
+resource "google_project_iam_member" "cloudbuild_artifact_writer" {
+  project = var.project_id
+  role    = "roles/artifactregistry.writer"
+  member  = local.cloud_build_sa
+}
+
+# -----------------------------------------------------------------------------
 # Artifact Registry for Docker Images
 # -----------------------------------------------------------------------------
 
@@ -943,79 +976,10 @@ variable "cloud_run_region" {
   default     = "us-central1"
 }
 
-resource "google_cloud_run_v2_service" "app" {
-  name     = "delivery-finance-app"
-  location = var.cloud_run_region
-  ingress  = "INGRESS_TRAFFIC_ALL"
-
-  template {
-    service_account = google_service_account.app_sa.email
-
-    containers {
-      image = "${var.cloud_run_region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.app_repo.repository_id}/app:latest"
-
-      ports {
-        container_port = 8080
-      }
-
-      env {
-        name  = "GCP_PROJECT_ID"
-        value = var.project_id
-      }
-
-      env {
-        name  = "BQ_DATASET_ID"
-        value = google_bigquery_dataset.delivery_finance.dataset_id
-      }
-
-      env {
-        name  = "GEMINI_MODEL"
-        value = "gemini-1.5-pro"
-      }
-
-      resources {
-        limits = {
-          cpu    = "2"
-          memory = "2Gi"
-        }
-      }
-
-      startup_probe {
-        http_get {
-          path = "/"
-        }
-        initial_delay_seconds = 10
-        period_seconds        = 10
-        failure_threshold     = 3
-      }
-    }
-
-    scaling {
-      min_instance_count = 0
-      max_instance_count = 5
-    }
-  }
-
-  depends_on = [
-    google_project_service.required_apis,
-    google_artifact_registry_repository.app_repo,
-  ]
-
-  lifecycle {
-    ignore_changes = [
-      template[0].containers[0].image,
-    ]
-  }
-}
-
-# Allow unauthenticated access (or remove this for authenticated only)
-resource "google_cloud_run_v2_service_iam_member" "public_access" {
-  project  = var.project_id
-  location = google_cloud_run_v2_service.app.location
-  name     = google_cloud_run_v2_service.app.name
-  role     = "roles/run.invoker"
-  member   = "allUsers"
-}
+# NOTE: Cloud Run service is deployed by Cloud Build (cloudbuild.yaml)
+# Terraform manages: BigQuery, Artifact Registry, Service Account, IAM
+# Cloud Build manages: Docker image builds and Cloud Run deployments
+# This separation prevents state drift between the two systems.
 
 # -----------------------------------------------------------------------------
 # Outputs
@@ -1050,7 +1014,7 @@ output "artifact_registry_url" {
   description = "Artifact Registry URL for Docker images"
 }
 
-output "cloud_run_url" {
-  value       = google_cloud_run_v2_service.app.uri
-  description = "Cloud Run Service URL"
+output "cloud_run_region" {
+  value       = var.cloud_run_region
+  description = "Region where Cloud Run service will be deployed"
 }

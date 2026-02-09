@@ -2,12 +2,29 @@
 
 This guide walks you through deploying the Delivery Finance App to Google Cloud Platform.
 
+## Files You Need
+
+```
+delivery-finance-app/
+├── app/
+│   ├── main.py              # Streamlit application
+│   ├── universal_etl.py     # ETL processing logic
+│   ├── requirements.txt     # Python dependencies
+│   ├── Dockerfile           # Container definition
+│   ├── cloudbuild.yaml      # Cloud Build deployment
+│   └── .dockerignore        # Docker build optimization
+└── terraform/
+    └── main.tf              # Infrastructure as code
+```
+
+**That's it - just these 7 files.**
+
 ## Prerequisites
 
 1. **GCP Project** with billing enabled
 2. **gcloud CLI** installed and authenticated
 3. **Terraform** >= 1.0.0 installed
-4. **Docker** installed (for local testing)
+4. **Docker** installed (for local testing only)
 
 ## Architecture
 
@@ -51,10 +68,34 @@ gcloud services enable \
     cloudbuild.googleapis.com \
     artifactregistry.googleapis.com \
     aiplatform.googleapis.com \
-    secretmanager.googleapis.com
+    sourcerepo.googleapis.com
+```
+
+## Step 1b: Set Up GCP Source Repository (Optional)
+
+If you want to use GCP Source Repositories instead of GitHub:
+
+```bash
+# Create repository
+gcloud source repos create delivery-finance-app
+
+# Clone it locally
+gcloud source repos clone delivery-finance-app ~/delivery-finance-app
+cd ~/delivery-finance-app
+
+# Copy files (from wherever you downloaded them)
+cp -r /path/to/app ./
+cp -r /path/to/terraform ./
+
+# Commit and push
+git add .
+git commit -m "Initial commit"
+git push origin master
 ```
 
 ## Step 2: Deploy Infrastructure with Terraform
+
+Terraform manages: **BigQuery, Artifact Registry, Service Account, IAM**
 
 ```bash
 cd terraform
@@ -73,14 +114,28 @@ terraform output
 ```
 
 This creates:
-- BigQuery dataset with tables for projects, allocations, rate_cards, costs, etc.
-- Service account with necessary permissions
+- BigQuery dataset with 8 tables (projects, allocations, rate_cards, costs, etc.)
+- Service account with BigQuery, Vertex AI, and logging permissions
 - Artifact Registry for Docker images
-- Cloud Run service (initially with placeholder image)
+- IAM permissions for Cloud Build to deploy
 
 ## Step 3: Build and Deploy the Application
 
-### Option A: Manual Deployment
+Cloud Build manages: **Docker builds and Cloud Run deployments**
+
+```bash
+cd app
+
+# Deploy using Cloud Build (recommended)
+gcloud builds submit --config=cloudbuild.yaml .
+
+# Get your app URL
+gcloud run services describe delivery-finance-app \
+    --region us-central1 \
+    --format="value(status.url)"
+```
+
+### Alternative: Manual Deployment
 
 ```bash
 cd app
@@ -100,20 +155,12 @@ gcloud run deploy delivery-finance-app \
     --platform managed \
     --region $REGION \
     --allow-unauthenticated \
+    --service-account delivery-finance-app@${PROJECT_ID}.iam.gserviceaccount.com \
     --set-env-vars "GCP_PROJECT_ID=${PROJECT_ID},BQ_DATASET_ID=delivery_finance,CLOUD_RUN_REGION=${REGION}" \
     --memory 2Gi \
     --cpu 2 \
     --min-instances 0 \
     --max-instances 5
-```
-
-### Option B: Cloud Build (Automated)
-
-```bash
-cd app
-
-# Submit build to Cloud Build
-gcloud builds submit --config=cloudbuild.yaml .
 ```
 
 ## Step 4: Access the Application
