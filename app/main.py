@@ -899,7 +899,9 @@ def render_process_step():
     with st.expander("Processing Log"):
         for log in results['processing_log']:
             icon = "✅" if log['status'] == 'success' else "❌" if log['status'] == 'error' else "⏭️"
-            st.write(f"{icon} **{log['sheet']}** ({log['type']}): {log.get('message', f\"{log.get('rows', 0)} rows\")}")
+            row_count = log.get('rows', 0)
+            message = log.get('message', f"{row_count} rows")
+            st.write(f"{icon} **{log['sheet']}** ({log['type']}): {message}")
 
     if st.button("Continue →", type="primary"):
         st.session_state.current_step = 'complete'
