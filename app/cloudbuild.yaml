@@ -8,7 +8,6 @@ substitutions:
   _REGION: us-central1
   _SERVICE_NAME: delivery-finance-app
   _REPO_NAME: delivery-finance-app
-  _SERVICE_ACCOUNT: delivery-finance-app@${PROJECT_ID}.iam.gserviceaccount.com
 
 steps:
   # Build the Docker image
@@ -43,7 +42,7 @@ steps:
       - 'managed'
       - '--allow-unauthenticated'
       - '--service-account'
-      - '${_SERVICE_ACCOUNT}'
+      - 'delivery-finance-app@$PROJECT_ID.iam.gserviceaccount.com'
       - '--set-env-vars'
       - 'GCP_PROJECT_ID=${PROJECT_ID},BQ_DATASET_ID=delivery_finance,CLOUD_RUN_REGION=${_REGION}'
       - '--memory'
