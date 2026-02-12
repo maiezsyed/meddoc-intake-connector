@@ -953,6 +953,14 @@ resource "google_project_iam_member" "cloudbuild_artifact_writer" {
   member  = local.cloud_build_sa
 }
 
+# Allow Compute Engine default SA to act as the app service account
+# This is needed because Cloud Build uses the Compute Engine default SA in some contexts
+resource "google_service_account_iam_member" "compute_sa_can_use_app_sa" {
+  service_account_id = google_service_account.app_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com"
+}
+
 # -----------------------------------------------------------------------------
 # Artifact Registry for Docker Images
 # -----------------------------------------------------------------------------
