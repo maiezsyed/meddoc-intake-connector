@@ -393,11 +393,13 @@ def build_context_prompt(user_query: str) -> str:
 - Answering questions about project financials and allocations
 - Providing insights on resource planning
 
-Available data includes project estimates, rate cards, resource allocations, and costs.
+IMPORTANT: You must ONLY reference projects and data that are explicitly provided below.
+Do NOT make up or hallucinate project names, costs, or any other data.
+If no relevant projects are found in the database, say so clearly.
 """
 
     if len(similar_projects) > 0:
-        context += "\n\nRelevant projects found:\n"
+        context += f"\n\nFound {len(similar_projects)} relevant project(s) in the database:\n"
         for _, proj in similar_projects.iterrows():
             context += f"""
 ---
@@ -408,6 +410,8 @@ Estimated Fees: ${proj.get('total_estimated_fees', 0):,.0f}
 Estimated Hours: {proj.get('total_estimated_hours', 0):,.0f}
 Billing Type: {proj.get('billing_type', 'N/A')}
 """
+    else:
+        context += "\n\nNO PROJECTS FOUND in the database matching this query. The database may be empty or no projects match the search terms. Please inform the user that no matching projects were found and suggest they upload project data first."
 
     return context
 
