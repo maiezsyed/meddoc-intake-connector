@@ -378,6 +378,83 @@ def get_dashboard_metrics() -> dict:
     return {'total_projects': 0, 'total_fees': 0, 'total_hours': 0}
 
 
+def upload_project_to_bigquery(project_record: dict) -> bool:
+    """Upload a project record to BigQuery."""
+    client = get_bq_client()
+    if not client:
+        st.error("BigQuery client not available. Check GCP_PROJECT_ID configuration.")
+        return False
+
+    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET_ID}.projects"
+
+    # Prepare the row with all required fields
+    row = {
+        'project_id': project_record.get('project_id', str(uuid.uuid4())),
+        'client_name': project_record.get('client_name', 'Unknown'),
+        'project_title': project_record.get('project_title', 'Untitled'),
+        'project_number': project_record.get('project_number'),
+        'company_code': project_record.get('company_code'),
+        'market_region': project_record.get('market_region'),
+        'rate_card_used': project_record.get('rate_card_used'),
+        'billing_type': project_record.get('billing_type'),
+        'start_date': project_record.get('start_date'),
+        'end_date': project_record.get('end_date'),
+        'scope_description': project_record.get('scope_description'),
+        'scope_tags': project_record.get('scope_tags', []),
+        'total_estimated_fees': project_record.get('total_estimated_fees'),
+        'total_estimated_hours': project_record.get('total_estimated_hours'),
+        'total_estimated_cost': project_record.get('total_estimated_cost'),
+        'target_gross_margin': project_record.get('target_gross_margin'),
+        'status': project_record.get('status', 'Draft'),
+        'source_file': project_record.get('source_file'),
+        'source_sheet': project_record.get('source_sheet'),
+        'sheet_metadata': project_record.get('sheet_metadata'),
+        'sheet_metadata_zone': json.dumps(project_record.get('sheet_metadata_zone')) if project_record.get('sheet_metadata_zone') else None,
+        'pricing_panel_qa': json.dumps(project_record.get('pricing_panel_qa')) if project_record.get('pricing_panel_qa') else None,
+        'extra_fields': json.dumps(project_record.get('extra_fields')) if project_record.get('extra_fields') else None,
+        'ingested_at': datetime.utcnow().isoformat(),
+    }
+
+    try:
+        errors = client.insert_rows_json(table_id, [row])
+        if errors:
+            st.error(f"BigQuery insert errors: {errors}")
+            return False
+        return True
+    except Exception as e:
+        st.error(f"BigQuery upload error: {e}")
+        return False
+
+
+def log_ingestion(file_name: str, sheet_name: str, sheet_type: str, status: str,
+                  rows_processed: int = 0, error_message: str = None, user_metadata: str = None) -> bool:
+    """Log ingestion to BigQuery ingestion_log table."""
+    client = get_bq_client()
+    if not client:
+        return False
+
+    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET_ID}.ingestion_log"
+
+    row = {
+        'ingestion_id': str(uuid.uuid4()),
+        'source_file': file_name,
+        'source_sheet': sheet_name,
+        'sheet_type': sheet_type,
+        'user_metadata': user_metadata,
+        'rows_processed': rows_processed,
+        'status': status,
+        'error_message': error_message,
+        'ingested_by': 'streamlit_app',
+        'ingested_at': datetime.utcnow().isoformat(),
+    }
+
+    try:
+        errors = client.insert_rows_json(table_id, [row])
+        return len(errors) == 0
+    except Exception:
+        return False
+
+
 # =============================================================================
 # GEMINI CHAT FUNCTIONS
 # =============================================================================
@@ -859,6 +936,7 @@ def render_process_step():
             )
 
             # Create project record
+            rows_processed = len(df) - header_row - 1
             project_record = {
                 'project_id': project_id,
                 'client_name': metadata.get('client_name'),
@@ -868,21 +946,38 @@ def render_process_step():
                 'start_date': metadata.get('start_date'),
                 'end_date': metadata.get('end_date'),
                 'scope_description': metadata.get('scope_description'),
-                'scope_tags': metadata.get('scope_tags'),
+                'scope_tags': metadata.get('scope_tags', []),
+                'total_estimated_hours': rows_processed,  # Placeholder - would come from actual parsing
                 'source_file': file_name,
                 'source_sheet': sheet_info['name'],
-                'sheet_type': sheet_type,
-                'year_tag': sheet_info.get('year_tag'),
-                'rows_processed': len(df) - header_row - 1,
+                'sheet_metadata': sheet_info.get('year_tag'),
+                'status': 'Draft',
             }
-            results['projects'].append(project_record)
 
-            results['processing_log'].append({
-                'sheet': sheet_info['name'],
-                'type': sheet_type,
-                'status': 'success',
-                'rows': len(df) - header_row - 1
-            })
+            # Upload to BigQuery
+            upload_success = upload_project_to_bigquery(project_record)
+
+            if upload_success:
+                results['projects'].append(project_record)
+                results['processing_log'].append({
+                    'sheet': sheet_info['name'],
+                    'type': sheet_type,
+                    'status': 'success',
+                    'rows': rows_processed,
+                    'message': f'{rows_processed} rows uploaded to BigQuery'
+                })
+                # Log successful ingestion
+                log_ingestion(file_name, sheet_info['name'], sheet_type, 'success',
+                             rows_processed, user_metadata=sheet_info.get('year_tag'))
+            else:
+                results['processing_log'].append({
+                    'sheet': sheet_info['name'],
+                    'type': sheet_type,
+                    'status': 'error',
+                    'message': 'Failed to upload to BigQuery'
+                })
+                log_ingestion(file_name, sheet_info['name'], sheet_type, 'failed',
+                             error_message='BigQuery upload failed')
 
         except Exception as e:
             results['processing_log'].append({
