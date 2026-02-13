@@ -28,6 +28,13 @@ try:
 except ImportError:
     VERTEX_AI_AVAILABLE = False
 
+# Import extraction logic from universal_etl
+try:
+    from universal_etl import extract_sheet_metadata
+    ETL_AVAILABLE = True
+except ImportError:
+    ETL_AVAILABLE = False
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -301,6 +308,7 @@ def query_similar_projects(scope_description: str, limit: int = 5) -> pd.DataFra
         SELECT
             project_id, client_name, project_title, scope_description, scope_tags,
             total_estimated_fees, total_estimated_hours, total_estimated_cost,
+            target_gross_margin, rate_card_used,
             billing_type, market_region, start_date, end_date
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.projects`
         ORDER BY ingested_at DESC
@@ -320,6 +328,7 @@ def query_similar_projects(scope_description: str, limit: int = 5) -> pd.DataFra
         SELECT
             project_id, client_name, project_title, scope_description, scope_tags,
             total_estimated_fees, total_estimated_hours, total_estimated_cost,
+            target_gross_margin, rate_card_used,
             billing_type, market_region, start_date, end_date
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.projects`
         WHERE {keyword_conditions}
@@ -515,20 +524,29 @@ def build_context_prompt(user_query: str) -> str:
 
 PRIMARY USE CASE: When a PM asks about a new project (e.g., "website redesign", "creative campaign", "app development"), your job is to:
 1. Find relevant past projects with similar scope
-2. Present key metrics that help with estimation: hours, fees, team composition, duration
-3. Highlight what's comparable and what might differ
+2. Present key financial metrics: fees (revenue), costs, profit margin, hours, duration
+3. Highlight team composition and rate cards used
+4. Help PMs understand what drove profitability on similar projects
+
+KEY METRICS TO HIGHLIGHT:
+- Total Fees (revenue to client)
+- Total Cost (internal labor cost)
+- Gross Margin % (profit / fees) - this is critical for pricing decisions
+- Hours by discipline/department
+- Effective hourly rate
 
 RESPONSE FORMAT for project comparison queries:
 - Start with a brief summary of what you found
-- Present each relevant project with its key metrics
-- If helpful, note patterns (e.g., "website projects typically range from X-Y hours")
-- Suggest what factors might make the new project larger/smaller
+- Present each relevant project with its financial metrics
+- Call out projects with good margins vs. challenging ones
+- If helpful, note patterns (e.g., "website projects typically achieve 30-40% margin")
+- Suggest what factors might affect margin on the new project
 
 CRITICAL RULES:
 - ONLY reference projects explicitly provided in the context below
-- NEVER make up or hallucinate project names, costs, hours, or any data
+- NEVER make up or hallucinate project names, costs, hours, margins, or any data
 - If no relevant projects exist, clearly say so and suggest uploading similar past projects
-- Be specific with numbers - PMs need concrete reference points
+- Be specific with numbers - PMs need concrete reference points for pricing
 """
 
     if len(similar_projects) > 0:
@@ -543,6 +561,20 @@ CRITICAL RULES:
             fees = proj.get('total_estimated_fees', 0) or 0
             hours = proj.get('total_estimated_hours', 0) or 0
             cost = proj.get('total_estimated_cost', 0) or 0
+            margin = proj.get('target_gross_margin')
+            rate_card = proj.get('rate_card_used', 'N/A')
+
+            # Calculate profit margin if we have the data
+            if margin:
+                margin_str = f"{margin:.1f}%"
+            elif fees and cost and fees > 0:
+                calculated_margin = ((fees - cost) / fees) * 100
+                margin_str = f"{calculated_margin:.1f}% (calculated)"
+            else:
+                margin_str = "N/A"
+
+            # Calculate profit amount
+            profit = fees - cost if fees and cost else 0
 
             # Calculate duration if dates available
             duration_str = "N/A"
@@ -561,13 +593,16 @@ PROJECT: {proj.get('project_title', 'Untitled')}
 Client: {proj.get('client_name', 'N/A')}
 Billing Type: {proj.get('billing_type', 'N/A')}
 Market: {proj.get('market_region', 'N/A')}
+Rate Card: {rate_card}
 
-KEY METRICS:
-- Total Estimated Hours: {hours:,.0f}
-- Total Estimated Fees: ${fees:,.0f}
+FINANCIAL METRICS:
+- Total Estimated Fees (Revenue): ${fees:,.0f}
 - Total Estimated Cost: ${cost:,.0f}
+- Gross Profit: ${profit:,.0f}
+- Gross Margin: {margin_str}
+- Total Hours: {hours:,.0f}
+- Effective Hourly Rate: ${(fees/hours if hours > 0 else 0):,.0f}/hr
 - Duration: {duration_str}
-- Effective Rate: ${(fees/hours if hours > 0 else 0):,.0f}/hr
 
 SCOPE: {(proj.get('scope_description', 'N/A')[:800] if proj.get('scope_description') else 'No scope description')}
 Tags: {', '.join(proj.get('scope_tags', [])) if proj.get('scope_tags') else 'None'}
@@ -1034,6 +1069,61 @@ def render_process_step():
                 file_name
             )
 
+            # Extract financial data from the sheet metadata zone
+            sheet_meta = {}
+            financial_data = {}
+            if ETL_AVAILABLE and sheet_type == 'plan':
+                try:
+                    sheet_meta = extract_sheet_metadata(df, header_row)
+                    financial_summary = sheet_meta.get('financial_summary', {})
+                    project_info = sheet_meta.get('project_info', {})
+                    config = sheet_meta.get('configuration', {})
+
+                    # Extract financial metrics
+                    total_fees = financial_summary.get('total_project_fee') or financial_summary.get('billable_labor_fees')
+                    total_hours = financial_summary.get('total_hours')
+                    total_cost = financial_summary.get('total_cost') or financial_summary.get('labor_costs')
+                    gross_margin = financial_summary.get('estimated_gross_margin') or financial_summary.get('gross_margin')
+
+                    # Calculate profit margin if we have fees and cost
+                    if total_fees and total_cost:
+                        try:
+                            profit_margin_pct = ((float(total_fees) - float(total_cost)) / float(total_fees)) * 100
+                        except (ValueError, ZeroDivisionError):
+                            profit_margin_pct = None
+                    elif gross_margin:
+                        # gross_margin might already be a percentage
+                        try:
+                            gm = float(gross_margin)
+                            profit_margin_pct = gm if gm <= 1 else gm / 100 * 100  # Handle both 0.35 and 35%
+                            if gm > 1:
+                                profit_margin_pct = gm  # Already a percentage like 35
+                            else:
+                                profit_margin_pct = gm * 100  # Convert 0.35 to 35
+                        except (ValueError, TypeError):
+                            profit_margin_pct = None
+                    else:
+                        profit_margin_pct = None
+
+                    financial_data = {
+                        'total_estimated_fees': float(total_fees) if total_fees else None,
+                        'total_estimated_hours': float(total_hours) if total_hours else None,
+                        'total_estimated_cost': float(total_cost) if total_cost else None,
+                        'target_gross_margin': profit_margin_pct,
+                        'market_region': config.get('market'),
+                        'rate_card_used': config.get('rate_card'),
+                        'billing_type': config.get('billing_type') or metadata.get('billing_type'),
+                    }
+
+                    # Use dates from sheet if not provided by user
+                    if not metadata.get('start_date') and project_info.get('start_date'):
+                        financial_data['start_date'] = str(project_info['start_date'])
+                    if not metadata.get('end_date') and project_info.get('end_date'):
+                        financial_data['end_date'] = str(project_info['end_date'])
+
+                except Exception as e:
+                    st.warning(f"Could not extract financial data from {sheet_info['name']}: {e}")
+
             # Create project record
             rows_processed = len(df) - header_row - 1
             project_record = {
@@ -1041,15 +1131,21 @@ def render_process_step():
                 'client_name': metadata.get('client_name'),
                 'project_title': metadata.get('project_title'),
                 'project_number': metadata.get('project_number'),
-                'billing_type': metadata.get('billing_type'),
-                'start_date': metadata.get('start_date'),
-                'end_date': metadata.get('end_date'),
+                'billing_type': financial_data.get('billing_type') or metadata.get('billing_type'),
+                'start_date': financial_data.get('start_date') or metadata.get('start_date'),
+                'end_date': financial_data.get('end_date') or metadata.get('end_date'),
                 'scope_description': metadata.get('scope_description'),
                 'scope_tags': metadata.get('scope_tags', []),
-                'total_estimated_hours': rows_processed,  # Placeholder - would come from actual parsing
+                'total_estimated_fees': financial_data.get('total_estimated_fees'),
+                'total_estimated_hours': financial_data.get('total_estimated_hours') or rows_processed,
+                'total_estimated_cost': financial_data.get('total_estimated_cost'),
+                'target_gross_margin': financial_data.get('target_gross_margin'),
+                'market_region': financial_data.get('market_region'),
+                'rate_card_used': financial_data.get('rate_card_used'),
                 'source_file': file_name,
                 'source_sheet': sheet_info['name'],
                 'sheet_metadata': sheet_info.get('year_tag'),
+                'sheet_metadata_zone': sheet_meta if sheet_meta else None,
                 'status': 'Draft',
             }
 
