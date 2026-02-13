@@ -286,32 +286,46 @@ def find_header_row(df: pd.DataFrame, sheet_type: str, max_rows: int = 60) -> in
 # =============================================================================
 
 def query_similar_projects(scope_description: str, limit: int = 5) -> pd.DataFrame:
-    """Query projects with similar scope descriptions."""
+    """Query projects with similar scope descriptions, titles, or tags."""
     client = get_bq_client()
     if not client:
         return pd.DataFrame()
 
-    # Simple keyword-based search (in production, use Vector Search)
-    keywords = [w.lower() for w in scope_description.split() if len(w) > 3]
-    keyword_conditions = " OR ".join([f"LOWER(scope_description) LIKE '%{kw}%'" for kw in keywords[:10]])
+    # Extract meaningful keywords (skip common words)
+    stop_words = {'the', 'and', 'for', 'with', 'this', 'that', 'have', 'from', 'they', 'been', 'will', 'would', 'could', 'should', 'about', 'what', 'which', 'their', 'there', 'where', 'when', 'project', 'projects'}
+    keywords = [w.lower() for w in scope_description.split() if len(w) > 3 and w.lower() not in stop_words]
 
-    query = f"""
-    SELECT
-        project_id,
-        client_name,
-        project_title,
-        scope_description,
-        scope_tags,
-        total_estimated_fees,
-        total_estimated_hours,
-        billing_type,
-        start_date,
-        end_date
-    FROM `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.projects`
-    WHERE {keyword_conditions if keyword_conditions else "1=1"}
-    ORDER BY ingested_at DESC
-    LIMIT {limit}
-    """
+    if not keywords:
+        # If no good keywords, return recent projects
+        query = f"""
+        SELECT
+            project_id, client_name, project_title, scope_description, scope_tags,
+            total_estimated_fees, total_estimated_hours, total_estimated_cost,
+            billing_type, market_region, start_date, end_date
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.projects`
+        ORDER BY ingested_at DESC
+        LIMIT {limit}
+        """
+    else:
+        # Search in scope_description, project_title, and scope_tags
+        conditions = []
+        for kw in keywords[:10]:
+            conditions.append(f"LOWER(scope_description) LIKE '%{kw}%'")
+            conditions.append(f"LOWER(project_title) LIKE '%{kw}%'")
+            conditions.append(f"EXISTS(SELECT 1 FROM UNNEST(scope_tags) tag WHERE LOWER(tag) LIKE '%{kw}%')")
+
+        keyword_conditions = " OR ".join(conditions)
+
+        query = f"""
+        SELECT
+            project_id, client_name, project_title, scope_description, scope_tags,
+            total_estimated_fees, total_estimated_hours, total_estimated_cost,
+            billing_type, market_region, start_date, end_date
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.projects`
+        WHERE {keyword_conditions}
+        ORDER BY ingested_at DESC
+        LIMIT {limit}
+        """
 
     try:
         return client.query(query).to_dataframe()
@@ -348,6 +362,39 @@ def get_project_allocations(project_id: str) -> pd.DataFrame:
         return client.query(query, job_config=job_config).to_dataframe()
     except Exception:
         return pd.DataFrame()
+
+
+def get_team_breakdown_for_projects(project_ids: list) -> dict:
+    """Get team breakdown by department for multiple projects."""
+    client = get_bq_client()
+    if not client or not project_ids:
+        return {}
+
+    # Format project IDs for SQL
+    ids_str = ", ".join([f"'{pid}'" for pid in project_ids])
+
+    query = f"""
+    SELECT
+        project_id,
+        department,
+        SUM(hours) as total_hours
+    FROM `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.allocations`
+    WHERE project_id IN ({ids_str})
+    GROUP BY project_id, department
+    ORDER BY project_id, total_hours DESC
+    """
+
+    try:
+        df = client.query(query).to_dataframe()
+        # Group by project_id
+        result = {}
+        for pid in project_ids:
+            proj_df = df[df['project_id'] == pid]
+            if len(proj_df) > 0:
+                result[pid] = proj_df[['department', 'total_hours']].to_dict('records')
+        return result
+    except Exception:
+        return {}
 
 
 def get_dashboard_metrics() -> dict:
@@ -464,31 +511,83 @@ def build_context_prompt(user_query: str) -> str:
     # Get relevant projects
     similar_projects = query_similar_projects(user_query)
 
-    context = """You are a helpful assistant for a delivery finance team. You help with:
-- Finding similar past projects for estimating new work
-- Analyzing project scope and estimates
-- Answering questions about project financials and allocations
-- Providing insights on resource planning
+    context = """You are an expert assistant helping project managers estimate new projects by finding and comparing similar past projects.
 
-IMPORTANT: You must ONLY reference projects and data that are explicitly provided below.
-Do NOT make up or hallucinate project names, costs, or any other data.
-If no relevant projects are found in the database, say so clearly.
+PRIMARY USE CASE: When a PM asks about a new project (e.g., "website redesign", "creative campaign", "app development"), your job is to:
+1. Find relevant past projects with similar scope
+2. Present key metrics that help with estimation: hours, fees, team composition, duration
+3. Highlight what's comparable and what might differ
+
+RESPONSE FORMAT for project comparison queries:
+- Start with a brief summary of what you found
+- Present each relevant project with its key metrics
+- If helpful, note patterns (e.g., "website projects typically range from X-Y hours")
+- Suggest what factors might make the new project larger/smaller
+
+CRITICAL RULES:
+- ONLY reference projects explicitly provided in the context below
+- NEVER make up or hallucinate project names, costs, hours, or any data
+- If no relevant projects exist, clearly say so and suggest uploading similar past projects
+- Be specific with numbers - PMs need concrete reference points
 """
 
     if len(similar_projects) > 0:
-        context += f"\n\nFound {len(similar_projects)} relevant project(s) in the database:\n"
+        # Get team breakdowns for found projects
+        project_ids = similar_projects['project_id'].tolist()
+        team_breakdowns = get_team_breakdown_for_projects(project_ids)
+
+        context += f"\n\n=== FOUND {len(similar_projects)} RELEVANT PROJECT(S) ===\n"
+
         for _, proj in similar_projects.iterrows():
+            pid = proj.get('project_id', '')
+            fees = proj.get('total_estimated_fees', 0) or 0
+            hours = proj.get('total_estimated_hours', 0) or 0
+            cost = proj.get('total_estimated_cost', 0) or 0
+
+            # Calculate duration if dates available
+            duration_str = "N/A"
+            if proj.get('start_date') and proj.get('end_date'):
+                try:
+                    start = pd.to_datetime(proj['start_date'])
+                    end = pd.to_datetime(proj['end_date'])
+                    weeks = (end - start).days // 7
+                    duration_str = f"{weeks} weeks"
+                except Exception:
+                    pass
+
             context += f"""
 ---
-Project: {proj.get('project_title', 'N/A')}
+PROJECT: {proj.get('project_title', 'Untitled')}
 Client: {proj.get('client_name', 'N/A')}
-Scope: {proj.get('scope_description', 'N/A')[:500] if proj.get('scope_description') else 'N/A'}
-Estimated Fees: ${proj.get('total_estimated_fees', 0):,.0f}
-Estimated Hours: {proj.get('total_estimated_hours', 0):,.0f}
 Billing Type: {proj.get('billing_type', 'N/A')}
+Market: {proj.get('market_region', 'N/A')}
+
+KEY METRICS:
+- Total Estimated Hours: {hours:,.0f}
+- Total Estimated Fees: ${fees:,.0f}
+- Total Estimated Cost: ${cost:,.0f}
+- Duration: {duration_str}
+- Effective Rate: ${(fees/hours if hours > 0 else 0):,.0f}/hr
+
+SCOPE: {(proj.get('scope_description', 'N/A')[:800] if proj.get('scope_description') else 'No scope description')}
+Tags: {', '.join(proj.get('scope_tags', [])) if proj.get('scope_tags') else 'None'}
 """
+            # Add team breakdown if available
+            if pid in team_breakdowns and team_breakdowns[pid]:
+                context += "\nTEAM BREAKDOWN:\n"
+                for dept in team_breakdowns[pid][:5]:  # Top 5 departments
+                    context += f"  - {dept['department']}: {dept['total_hours']:,.0f} hrs\n"
     else:
-        context += "\n\nNO PROJECTS FOUND in the database matching this query. The database may be empty or no projects match the search terms. Please inform the user that no matching projects were found and suggest they upload project data first."
+        context += """
+
+=== NO MATCHING PROJECTS FOUND ===
+The database either has no projects yet, or none match the search terms.
+
+Please tell the user:
+1. No similar projects were found in the database
+2. They should upload past project estimate spreadsheets to build the reference library
+3. Once projects are uploaded, they can search for similar work to use as estimation benchmarks
+"""
 
     return context
 
