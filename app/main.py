@@ -41,7 +41,7 @@ except ImportError:
 
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
 BQ_DATASET_ID = os.environ.get("BQ_DATASET_ID", "delivery_finance")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash-002")
 CLOUD_RUN_REGION = os.environ.get("CLOUD_RUN_REGION", "us-central1")
 
 
