@@ -44,6 +44,23 @@ BQ_DATASET_ID = os.environ.get("BQ_DATASET_ID", "delivery_finance")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
 CLOUD_RUN_REGION = os.environ.get("CLOUD_RUN_REGION", "us-central1")
 
+
+def safe_json_serialize(obj):
+    """Convert an object to JSON-safe format, handling datetime objects."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {k: safe_json_serialize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [safe_json_serialize(item) for item in obj]
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if hasattr(obj, 'isoformat'):  # Handle pandas Timestamp and other date types
+        return obj.isoformat()
+    if pd.isna(obj):
+        return None
+    return obj
+
 # Sheet type detection patterns
 SHEET_TYPE_PATTERNS = {
     'plan': [r'^plan$', r'plan\s*\(', r'allocation', r'forecast', r'staffing', r'20\d{2}.*plan', r'plan.*20\d{2}'],
@@ -1145,7 +1162,7 @@ def render_process_step():
                 'source_file': file_name,
                 'source_sheet': sheet_info['name'],
                 'sheet_metadata': sheet_info.get('year_tag'),
-                'sheet_metadata_zone': sheet_meta if sheet_meta else None,
+                'sheet_metadata_zone': safe_json_serialize(sheet_meta) if sheet_meta else None,
                 'status': 'Draft',
             }
 
